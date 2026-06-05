@@ -1,0 +1,55 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Runtime data and generated artifacts
+data/
+ledger/*.jsonl
+*.db
+*.sqlite
+*.sqlite3
+
+# Model weights and downloaded model artifacts
+*.pt
+*.pth
+*.onnx
+*.engine
+*.safetensors
+models/
+
+# Vendored or downloaded third-party source trees
+third_party/
+
+# Video/media artifacts
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.mpeg
+*.mpg
+*.wmv
+*.flv
+*.webm
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
