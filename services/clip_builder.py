@@ -1,4 +1,6 @@
 """
+用于保存摔倒检测事件视频和元数据，既支持保存尚未经过 VLM 复核的 candidates 候选事件，也支持保存 confirmed_fall、rejected、need_human_review 等复核后的事件。
+
 Confirmed event clip writer.
 
 This module writes selected frame packets to a video file and stores metadata
@@ -98,7 +100,7 @@ class ClipBuilder:
     def save_event_clip(
         self,
         candidate: Dict[str, Any],
-        verification: Dict[str, Any],
+        verification: Optional[Dict[str, Any]],
         frame_packets: Sequence[Dict[str, Any]],
         event_id: Optional[str] = None,
         category: Optional[str] = None,
@@ -115,7 +117,7 @@ class ClipBuilder:
             raise ClipBuilderError("frame_packets must not be empty")
 
         camera_id = _camera_id_from(candidate, frame_packets)
-        category = category or str(verification.get("result") or "unknown")
+        category = category or _category_from_verification(verification)
         event_id = event_id or self._make_event_id(camera_id, candidate)
 
         clip_dir = self._event_dir(camera_id, category)
@@ -266,6 +268,12 @@ def _timestamp_ms(packet: Dict[str, Any]) -> int:
         return int(packet.get("timestamp_ms", 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _category_from_verification(verification: Optional[Dict[str, Any]]) -> str:
+    if verification is None:
+        return "candidates"
+    return str(verification.get("result") or "unknown")
 
 
 def _normalize_frame(frame: Any, width: int, height: int) -> Any:

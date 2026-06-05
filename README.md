@@ -53,6 +53,10 @@
 
 其中 YOLO 阶段负责快速筛选疑似事件，VLM 阶段负责减少误报，例如区分摔倒、坐下、弯腰、躺床、遮挡不清等情况。
 
+## 设计文档
+
+- [YOLO 和 VLM 异步处理需求文档](docs/requirements/yolo-vlm-async-processing.md)
+
 ## 目录结构
 
 ```text
