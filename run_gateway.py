@@ -1,4 +1,6 @@
 """
+本脚本负责运行本地视频摔倒检测入口：YOLO 在主流程中发现候选事件，异步模式下只保存候选片段并写入数据库队列，VLM 由后续 worker 单独复核。
+
 Local video gateway runner.
 
 This script simulates camera streams from local video files, runs YOLO fuzzy
@@ -16,9 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from config import DEFAULT_VLM_MODEL, EVENT_DIR, TEST_VIDEO_DIR
+from config import DB_PATH, DEFAULT_VLM_MODEL, EVENT_DIR, TEST_VIDEO_DIR
 from services.clip_builder import ClipBuilder
 from services.event_buffer import EventBuffer
+from services.event_repository import EventRepository
 from services.file_video_source import FileVideoSource
 from services.video_vlm_verifier import VideoVLMVerifier
 from services.yolo_candidate_detector import YoloCandidateDetector
@@ -68,6 +71,8 @@ class PipelineStats:
     vlm_rejected: int = 0
     vlm_review: int = 0
     clips_saved: int = 0
+    candidate_events_saved: int = 0
+    vlm_jobs_queued: int = 0
     errors: int = 0
 
 
@@ -94,8 +99,18 @@ def main() -> int:
         candidate_threshold=args.candidate_threshold,
         min_candidate_gap_ms=int(args.cooldown_seconds * 1000),
     )
+
+    async_vlm_enabled = is_async_vlm_enabled(args)
+    event_repository: Optional[EventRepository] = None
+    if async_vlm_enabled:
+        event_repository = EventRepository(args.queue_db_path).initialize()
+        logger.info(
+            "Async VLM enabled: candidate events will be queued in %s",
+            args.queue_db_path,
+        )
+
     vlm_verifier = None
-    if not args.skip_vlm:
+    if not args.skip_vlm and not async_vlm_enabled:
         vlm_verifier = VideoVLMVerifier(
             model_id=args.vlm_model,
             backend=args.vlm_backend,
@@ -123,6 +138,7 @@ def main() -> int:
                 event_buffer=event_buffer,
                 clip_builder=clip_builder,
                 stats=stats,
+                event_repository=event_repository,
             )
             stats.videos_processed += 1
         except Exception as exc:
@@ -149,6 +165,7 @@ def process_video_file(
     event_buffer: EventBuffer,
     clip_builder: ClipBuilder,
     stats: PipelineStats,
+    event_repository: Optional[EventRepository] = None,
 ) -> None:
     logger.info("Processing video: camera_id=%s source_uri=%s", camera_id, video_path)
 
@@ -183,6 +200,7 @@ def process_video_file(
                         clip_builder=clip_builder,
                         args=args,
                         stats=stats,
+                        event_repository=event_repository,
                     )
                     cooldown_until_ms = timestamp_ms + int(args.cooldown_seconds * 1000)
                     active_event = None
@@ -226,6 +244,7 @@ def process_video_file(
                 clip_builder=clip_builder,
                 args=args,
                 stats=stats,
+                event_repository=event_repository,
             )
     finally:
         source.close()
@@ -257,6 +276,7 @@ def finalize_event(
     clip_builder: ClipBuilder,
     args: argparse.Namespace,
     stats: PipelineStats,
+    event_repository: Optional[EventRepository] = None,
 ) -> None:
     candidate = active_event.candidate
     frames = active_event.frames
@@ -264,6 +284,16 @@ def finalize_event(
         logger.warning(
             "Skipping event with no frames: candidate_id=%s",
             candidate.get("candidate_id"),
+        )
+        return
+
+    if is_async_vlm_enabled(args):
+        save_candidate_event(
+            candidate=candidate,
+            frames=frames,
+            clip_builder=clip_builder,
+            event_repository=event_repository,
+            stats=stats,
         )
         return
 
@@ -320,6 +350,66 @@ def finalize_event(
         stats.errors += 1
         logger.exception(
             "Failed to save event clip: candidate_id=%s error=%s",
+            candidate.get("candidate_id"),
+            exc,
+        )
+
+
+def save_candidate_event(
+    candidate: Dict[str, Any],
+    frames: Sequence[Dict[str, Any]],
+    clip_builder: ClipBuilder,
+    event_repository: Optional[EventRepository],
+    stats: PipelineStats,
+) -> None:
+    try:
+        if event_repository is None:
+            raise RuntimeError("event_repository is required when async_vlm is enabled")
+
+        saved = clip_builder.save_event_clip(
+            candidate=candidate,
+            verification=None,
+            frame_packets=frames,
+            category="candidates",
+        )
+        event_id = str(saved.get("event_id") or "")
+        camera_id = str(
+            saved.get("camera_id")
+            or candidate.get("camera_id")
+            or frames[0].get("camera_id")
+            or ""
+        )
+        source_uri = str(
+            saved.get("source_uri")
+            or candidate.get("source_uri")
+            or frames[0].get("source_uri")
+            or ""
+        )
+
+        event_repository.create_candidate_event(
+            event_id=event_id,
+            camera_id=camera_id,
+            source_uri=source_uri,
+            clip_path=str(saved.get("clip_path") or ""),
+            metadata_path=str(saved.get("metadata_path") or ""),
+            candidate=candidate,
+            yolo_score=_candidate_score(candidate),
+        )
+        event_repository.enqueue_vlm_job(event_id=event_id)
+
+        stats.clips_saved += 1
+        stats.candidate_events_saved += 1
+        stats.vlm_jobs_queued += 1
+        logger.info(
+            "Queued candidate event for async VLM: event_id=%s camera_id=%s clip_path=%s",
+            event_id,
+            camera_id,
+            saved.get("clip_path"),
+        )
+    except Exception as exc:
+        stats.errors += 1
+        logger.exception(
+            "Failed to save candidate event: candidate_id=%s error=%s",
             candidate.get("candidate_id"),
             exc,
         )
@@ -391,6 +481,22 @@ def should_save_event(
     return False
 
 
+def is_async_vlm_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "async_vlm", False)) and not bool(
+        getattr(args, "skip_vlm", False)
+    )
+
+
+def _candidate_score(candidate: Dict[str, Any]) -> Optional[float]:
+    score = candidate.get("score")
+    if score is None:
+        return None
+    try:
+        return float(score)
+    except (TypeError, ValueError):
+        return None
+
+
 def scan_video_files(video_dir: Path, recursive: bool = False) -> List[Path]:
     if not video_dir.exists():
         raise FileNotFoundError(f"video_dir does not exist: {video_dir}")
@@ -442,6 +548,8 @@ def _default_arg_values() -> Dict[str, Any]:
         "yolo_conf": 0.25,
         "candidate_threshold": 0.55,
         "skip_vlm": False,
+        "async_vlm": True,
+        "queue_db_path": str(DB_PATH),
         "vlm_model": DEFAULT_VLM_MODEL,
         "vlm_backend": "transformers",
         "vlm_max_frames": 12,
@@ -519,6 +627,8 @@ def build_arg_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--candidate-threshold", type=float, default=defaults["candidate_threshold"])
 
     parser.add_argument("--skip-vlm", action=argparse.BooleanOptionalAction, default=defaults["skip_vlm"])
+    parser.add_argument("--async-vlm", action=argparse.BooleanOptionalAction, default=defaults["async_vlm"])
+    parser.add_argument("--queue-db-path", default=defaults["queue_db_path"])
     parser.add_argument("--vlm-model", default=defaults["vlm_model"])
     parser.add_argument(
         "--vlm-backend",

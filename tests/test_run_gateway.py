@@ -27,8 +27,40 @@ class FakeClipBuilder:
         self.saved.append(kwargs)
         return {
             "event_id": "event1",
+            "camera_id": kwargs["candidate"].get("camera_id", "cam1"),
+            "source_uri": kwargs["frame_packets"][0].get("source_uri", ""),
             "clip_path": "clip.mp4",
             "metadata_path": "clip.json",
+        }
+
+
+class FakeEventRepository:
+    def __init__(self):
+        self.created_events = []
+        self.queued_jobs = []
+
+    def create_candidate_event(self, **kwargs):
+        self.created_events.append(kwargs)
+        return dict(kwargs)
+
+    def enqueue_vlm_job(self, **kwargs):
+        self.queued_jobs.append(kwargs)
+        return {"job_id": f"vlm_{kwargs['event_id']}", **kwargs}
+
+
+class FakeVlmVerifier:
+    model_id = "fake-vlm"
+    backend = "fake"
+
+    def __init__(self):
+        self.called = False
+
+    def verify(self, **kwargs):
+        self.called = True
+        return {
+            "result": "confirmed_fall",
+            "confidence": 1.0,
+            "reason": "sync verifier should not run in async mode",
         }
 
 
@@ -101,6 +133,59 @@ class RunGatewayTest(unittest.TestCase):
         self.assertEqual(stats.vlm_confirmed, 1)
         self.assertEqual(stats.clips_saved, 1)
         self.assertEqual(clip_builder.saved[0]["category"], "confirmed_fall")
+
+    def test_finalize_event_in_async_mode_saves_candidate_and_queues_vlm_job(self):
+        stats = run_gateway.PipelineStats()
+        clip_builder = FakeClipBuilder()
+        repository = FakeEventRepository()
+        vlm_verifier = FakeVlmVerifier()
+        args = argparse.Namespace(
+            skip_vlm=False,
+            async_vlm=True,
+            vlm_confidence_threshold=0.6,
+            save_review=False,
+            save_rejected=False,
+        )
+        active = run_gateway.ActiveEvent(
+            candidate={
+                "camera_id": "cam1",
+                "candidate_id": "c1",
+                "timestamp_ms": 1000,
+                "score": 0.82,
+                "source_uri": "video.mp4",
+            },
+            frames=[
+                {
+                    "camera_id": "cam1",
+                    "frame_id": 0,
+                    "timestamp_ms": 1000,
+                    "frame": object(),
+                    "source_uri": "video.mp4",
+                }
+            ],
+            end_timestamp_ms=1000,
+        )
+
+        run_gateway.finalize_event(
+            active,
+            vlm_verifier,
+            clip_builder,
+            args,
+            stats,
+            event_repository=repository,
+        )
+
+        self.assertFalse(vlm_verifier.called)
+        self.assertEqual(stats.clips_saved, 1)
+        self.assertEqual(stats.candidate_events_saved, 1)
+        self.assertEqual(stats.vlm_jobs_queued, 1)
+        self.assertEqual(clip_builder.saved[0]["verification"], None)
+        self.assertEqual(clip_builder.saved[0]["category"], "candidates")
+        self.assertEqual(repository.created_events[0]["event_id"], "event1")
+        self.assertEqual(repository.created_events[0]["camera_id"], "cam1")
+        self.assertEqual(repository.created_events[0]["source_uri"], "video.mp4")
+        self.assertEqual(repository.created_events[0]["yolo_score"], 0.82)
+        self.assertEqual(repository.queued_jobs[0]["event_id"], "event1")
 
     def test_scan_video_files_filters_and_sorts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
