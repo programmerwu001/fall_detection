@@ -64,6 +64,71 @@ class FakeVlmVerifier:
         }
 
 
+class FakeFileVideoSource:
+    packets_by_uri = {}
+
+    def __init__(self, camera_id, source_uri, fps_limit=None, realtime=False, loop=False):
+        self.camera_id = camera_id
+        self.source_uri = source_uri
+        self.packets = [dict(packet) for packet in self.packets_by_uri[source_uri]]
+        self.index = 0
+
+    def open(self):
+        return self
+
+    def read(self):
+        if self.index >= len(self.packets):
+            return None
+        packet = dict(self.packets[self.index])
+        self.index += 1
+        packet.setdefault("camera_id", self.camera_id)
+        packet.setdefault("source_uri", self.source_uri)
+        packet.setdefault("frame", object())
+        packet.setdefault("width", 640)
+        packet.setdefault("height", 480)
+        packet.setdefault("fps", 10.0)
+        return packet
+
+    def close(self):
+        pass
+
+
+class RecordingYoloDetector:
+    def __init__(self):
+        self.packets = []
+
+    def detect(self, packet):
+        self.packets.append(dict(packet))
+        return []
+
+
+class BoundaryCandidateDetector:
+    def __init__(self, source_name, frame_id):
+        self.source_name = source_name
+        self.frame_id = frame_id
+        self.reset_count = 0
+
+    def detect(self, packet):
+        if (
+            Path(packet["source_uri"]).name == self.source_name
+            and packet["frame_id"] == self.frame_id
+        ):
+            return [
+                {
+                    "camera_id": packet["camera_id"],
+                    "candidate_id": "boundary_candidate",
+                    "timestamp_ms": packet["timestamp_ms"],
+                    "frame_id": packet["frame_id"],
+                    "score": 1.0,
+                    "source_uri": packet["source_uri"],
+                }
+            ]
+        return []
+
+    def reset_state(self):
+        self.reset_count += 1
+
+
 class RunGatewayTest(unittest.TestCase):
     def test_should_save_event_policy(self):
         self.assertTrue(
@@ -201,6 +266,306 @@ class RunGatewayTest(unittest.TestCase):
         self.assertEqual([path.name for path in non_recursive], ["a.mp4"])
         self.assertEqual([path.name for path in recursive], ["a.mp4", "c.avi"])
 
+    def test_process_video_sequence_treats_folder_as_one_continuous_camera(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "a.mp4"
+            second = root / "b.mp4"
+            first.write_text("", encoding="utf-8")
+            second.write_text("", encoding="utf-8")
+            FakeFileVideoSource.packets_by_uri = {
+                str(first): [
+                    {"frame_id": 0, "timestamp_ms": 0},
+                    {"frame_id": 1, "timestamp_ms": 100},
+                ],
+                str(second): [
+                    {"frame_id": 0, "timestamp_ms": 0},
+                    {"frame_id": 1, "timestamp_ms": 100},
+                ],
+            }
+            args = argparse.Namespace(
+                fps_limit=10.0,
+                realtime=False,
+                video_boundary_policy="continuous",
+                pre_event_seconds=3.0,
+                post_event_seconds=3.0,
+                cooldown_seconds=8.0,
+                skip_vlm=True,
+                async_vlm=False,
+                vlm_confidence_threshold=0.6,
+                save_review=False,
+                save_rejected=False,
+            )
+            detector = RecordingYoloDetector()
+            stats = run_gateway.PipelineStats()
+
+            with patch("run_gateway.FileVideoSource", FakeFileVideoSource):
+                run_gateway.process_video_sequence(
+                    video_paths=[first, second],
+                    camera_id="file_cam_001",
+                    args=args,
+                    yolo_detector=detector,
+                    vlm_verifier=None,
+                    event_buffer=EventBuffer(max_seconds=10),
+                    clip_builder=FakeClipBuilder(),
+                    stats=stats,
+                )
+
+        self.assertEqual([packet["camera_id"] for packet in detector.packets], ["file_cam_001"] * 4)
+        self.assertEqual([packet["frame_id"] for packet in detector.packets], [0, 1, 2, 3])
+        self.assertEqual([packet["timestamp_ms"] for packet in detector.packets], [0, 100, 200, 300])
+        self.assertEqual([Path(packet["source_uri"]).name for packet in detector.packets], ["a.mp4", "a.mp4", "b.mp4", "b.mp4"])
+        self.assertEqual(stats.frames_read, 4)
+        self.assertEqual(stats.videos_processed, 2)
+
+    def test_soft_reset_boundary_resets_frame_id_and_timestamp_for_unrelated_videos(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "a.mp4"
+            second = root / "b.mp4"
+            first.write_text("", encoding="utf-8")
+            second.write_text("", encoding="utf-8")
+            FakeFileVideoSource.packets_by_uri = {
+                str(first): [
+                    {"frame_id": 0, "timestamp_ms": 0},
+                    {"frame_id": 1, "timestamp_ms": 100},
+                ],
+                str(second): [
+                    {"frame_id": 0, "timestamp_ms": 0},
+                    {"frame_id": 1, "timestamp_ms": 100},
+                ],
+            }
+            args = argparse.Namespace(
+                fps_limit=10.0,
+                realtime=False,
+                video_boundary_policy="soft_reset",
+                pre_event_seconds=3.0,
+                post_event_seconds=3.0,
+                cooldown_seconds=8.0,
+                skip_vlm=True,
+                async_vlm=False,
+                vlm_confidence_threshold=0.6,
+                save_review=False,
+                save_rejected=False,
+            )
+            detector = RecordingYoloDetector()
+
+            with patch("run_gateway.FileVideoSource", FakeFileVideoSource):
+                run_gateway.process_video_sequence(
+                    video_paths=[first, second],
+                    camera_id="file_cam_001",
+                    args=args,
+                    yolo_detector=detector,
+                    vlm_verifier=None,
+                    event_buffer=EventBuffer(max_seconds=10),
+                    clip_builder=FakeClipBuilder(),
+                    stats=run_gateway.PipelineStats(),
+                )
+
+        self.assertEqual([packet["camera_id"] for packet in detector.packets], ["file_cam_001"] * 4)
+        self.assertEqual([packet["frame_id"] for packet in detector.packets], [0, 1, 0, 1])
+        self.assertEqual([packet["timestamp_ms"] for packet in detector.packets], [0, 100, 0, 100])
+        self.assertEqual(
+            [Path(packet["source_uri"]).name for packet in detector.packets],
+            ["a.mp4", "a.mp4", "b.mp4", "b.mp4"],
+        )
+
+    def test_soft_reset_boundary_does_not_include_previous_video_in_pre_event_clip(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "a.mp4"
+            second = root / "b.mp4"
+            first.write_text("", encoding="utf-8")
+            second.write_text("", encoding="utf-8")
+            FakeFileVideoSource.packets_by_uri = {
+                str(first): [
+                    {"frame_id": 0, "timestamp_ms": 0},
+                    {"frame_id": 1, "timestamp_ms": 100},
+                ],
+                str(second): [
+                    {"frame_id": 0, "timestamp_ms": 0},
+                ],
+            }
+            args = argparse.Namespace(
+                fps_limit=10.0,
+                realtime=False,
+                video_boundary_policy="soft_reset",
+                pre_event_seconds=3.0,
+                post_event_seconds=0.0,
+                cooldown_seconds=8.0,
+                skip_vlm=True,
+                async_vlm=False,
+                vlm_confidence_threshold=0.6,
+                save_review=False,
+                save_rejected=False,
+            )
+            detector = BoundaryCandidateDetector(source_name="b.mp4", frame_id=0)
+            clip_builder = FakeClipBuilder()
+
+            with patch("run_gateway.FileVideoSource", FakeFileVideoSource):
+                run_gateway.process_video_sequence(
+                    video_paths=[first, second],
+                    camera_id="file_cam_001",
+                    args=args,
+                    yolo_detector=detector,
+                    vlm_verifier=None,
+                    event_buffer=EventBuffer(max_seconds=10),
+                    clip_builder=clip_builder,
+                    stats=run_gateway.PipelineStats(),
+                )
+
+        saved_frames = clip_builder.saved[0]["frame_packets"]
+        self.assertEqual([Path(packet["source_uri"]).name for packet in saved_frames], ["b.mp4"])
+        self.assertEqual([packet["frame_id"] for packet in saved_frames], [0])
+        self.assertEqual([packet["timestamp_ms"] for packet in saved_frames], [0])
+        self.assertEqual(detector.reset_count, 1)
+
+    def test_continuous_boundary_keeps_previous_video_in_pre_event_clip(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "a.mp4"
+            second = root / "b.mp4"
+            first.write_text("", encoding="utf-8")
+            second.write_text("", encoding="utf-8")
+            FakeFileVideoSource.packets_by_uri = {
+                str(first): [
+                    {"frame_id": 0, "timestamp_ms": 0},
+                    {"frame_id": 1, "timestamp_ms": 100},
+                ],
+                str(second): [
+                    {"frame_id": 0, "timestamp_ms": 0},
+                ],
+            }
+            args = argparse.Namespace(
+                fps_limit=10.0,
+                realtime=False,
+                video_boundary_policy="continuous",
+                pre_event_seconds=3.0,
+                post_event_seconds=0.0,
+                cooldown_seconds=8.0,
+                skip_vlm=True,
+                async_vlm=False,
+                vlm_confidence_threshold=0.6,
+                save_review=False,
+                save_rejected=False,
+            )
+            detector = BoundaryCandidateDetector(source_name="b.mp4", frame_id=2)
+            clip_builder = FakeClipBuilder()
+
+            with patch("run_gateway.FileVideoSource", FakeFileVideoSource):
+                run_gateway.process_video_sequence(
+                    video_paths=[first, second],
+                    camera_id="file_cam_001",
+                    args=args,
+                    yolo_detector=detector,
+                    vlm_verifier=None,
+                    event_buffer=EventBuffer(max_seconds=10),
+                    clip_builder=clip_builder,
+                    stats=run_gateway.PipelineStats(),
+                )
+
+        saved_frames = clip_builder.saved[0]["frame_packets"]
+        self.assertEqual(
+            [Path(packet["source_uri"]).name for packet in saved_frames],
+            ["a.mp4", "a.mp4", "b.mp4"],
+        )
+        self.assertEqual([packet["frame_id"] for packet in saved_frames], [0, 1, 2])
+        self.assertEqual(detector.reset_count, 0)
+
+    def test_soft_reset_boundary_finalizes_partial_event_before_reset(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "a.mp4"
+            second = root / "b.mp4"
+            first.write_text("", encoding="utf-8")
+            second.write_text("", encoding="utf-8")
+            FakeFileVideoSource.packets_by_uri = {
+                str(first): [
+                    {"frame_id": 0, "timestamp_ms": 0},
+                    {"frame_id": 1, "timestamp_ms": 100},
+                ],
+                str(second): [
+                    {"frame_id": 0, "timestamp_ms": 0},
+                ],
+            }
+            args = argparse.Namespace(
+                fps_limit=10.0,
+                realtime=False,
+                video_boundary_policy="soft_reset",
+                pre_event_seconds=3.0,
+                post_event_seconds=5.0,
+                cooldown_seconds=8.0,
+                skip_vlm=True,
+                async_vlm=False,
+                vlm_confidence_threshold=0.6,
+                save_review=False,
+                save_rejected=False,
+            )
+            detector = BoundaryCandidateDetector(source_name="a.mp4", frame_id=1)
+            clip_builder = FakeClipBuilder()
+
+            with patch("run_gateway.FileVideoSource", FakeFileVideoSource):
+                run_gateway.process_video_sequence(
+                    video_paths=[first, second],
+                    camera_id="file_cam_001",
+                    args=args,
+                    yolo_detector=detector,
+                    vlm_verifier=None,
+                    event_buffer=EventBuffer(max_seconds=10),
+                    clip_builder=clip_builder,
+                    stats=run_gateway.PipelineStats(),
+                )
+
+        saved_frames = clip_builder.saved[0]["frame_packets"]
+        self.assertEqual([Path(packet["source_uri"]).name for packet in saved_frames], ["a.mp4", "a.mp4"])
+        self.assertEqual([packet["frame_id"] for packet in saved_frames], [0, 1])
+
+    def test_main_processes_selected_folder_as_one_simulated_camera(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "a.mp4"
+            second = root / "b.mp4"
+            first.write_text("", encoding="utf-8")
+            second.write_text("", encoding="utf-8")
+            args = argparse.Namespace(
+                video_dir=str(root),
+                recursive=False,
+                max_videos=None,
+                camera_prefix="file_cam",
+                video_boundary_policy="soft_reset",
+                log_level="INFO",
+                yolo_model="fake.pt",
+                yolo_device=None,
+                yolo_imgsz=640,
+                yolo_conf=0.25,
+                candidate_threshold=0.55,
+                cooldown_seconds=8.0,
+                skip_vlm=True,
+                async_vlm=False,
+                buffer_seconds=10.0,
+                pre_event_seconds=3.0,
+                post_event_seconds=3.0,
+                output_dir=str(root / "events"),
+            )
+            sequence_calls = []
+
+            def record_sequence(**kwargs):
+                sequence_calls.append(kwargs)
+
+            with (
+                patch("run_gateway.parse_args", return_value=args),
+                patch("run_gateway.YoloCandidateDetector", return_value=RecordingYoloDetector()),
+                patch("run_gateway.ClipBuilder", return_value=FakeClipBuilder()),
+                patch("run_gateway.process_video_sequence", side_effect=record_sequence),
+                patch("run_gateway.process_video_file"),
+            ):
+                exit_code = run_gateway.main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(sequence_calls), 1)
+        self.assertEqual(sequence_calls[0]["video_paths"], [first, second])
+        self.assertEqual(sequence_calls[0]["camera_id"], "file_cam_001")
+
     def test_parse_args_uses_config_defaults_and_allows_cli_override(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "detection_config.json"
@@ -210,6 +575,7 @@ class RunGatewayTest(unittest.TestCase):
                         "_注释": "中文说明字段应被忽略，不能影响参数解析。",
                         "video_dir": "from_config",
                         "max_videos": 5,
+                        "video_boundary_policy": "continuous",
                         "recursive": True,
                         "fps_limit": 8.0,
                         "candidate_threshold": 0.4,
@@ -237,6 +603,7 @@ class RunGatewayTest(unittest.TestCase):
         self.assertEqual(args.config, str(config_path))
         self.assertEqual(args.video_dir, "from_config")
         self.assertEqual(args.max_videos, 1)
+        self.assertEqual(args.video_boundary_policy, "continuous")
         self.assertTrue(args.recursive)
         self.assertEqual(args.fps_limit, 8.0)
         self.assertEqual(args.candidate_threshold, 0.7)

@@ -126,34 +126,183 @@ def main() -> int:
     event_buffer = EventBuffer(max_seconds=buffer_seconds)
     clip_builder = ClipBuilder(output_dir=args.output_dir)
 
-    for index, video_path in enumerate(video_files, start=1):
-        camera_id = f"{args.camera_prefix}_{index:03d}"
-        try:
-            process_video_file(
-                video_path=video_path,
-                camera_id=camera_id,
-                args=args,
-                yolo_detector=yolo_detector,
-                vlm_verifier=vlm_verifier,
-                event_buffer=event_buffer,
-                clip_builder=clip_builder,
-                stats=stats,
-                event_repository=event_repository,
-            )
-            stats.videos_processed += 1
-        except Exception as exc:
-            stats.errors += 1
-            logger.exception(
-                "Failed to process video: camera_id=%s source_uri=%s error=%s",
-                camera_id,
-                video_path,
-                exc,
-            )
-        finally:
-            event_buffer.clear(camera_id)
+    camera_id = f"{args.camera_prefix}_001"
+    try:
+        process_video_sequence(
+            video_paths=video_files,
+            camera_id=camera_id,
+            args=args,
+            yolo_detector=yolo_detector,
+            vlm_verifier=vlm_verifier,
+            event_buffer=event_buffer,
+            clip_builder=clip_builder,
+            stats=stats,
+            event_repository=event_repository,
+        )
+    except Exception as exc:
+        stats.errors += 1
+        logger.exception(
+            "Failed to process video sequence: camera_id=%s video_dir=%s error=%s",
+            camera_id,
+            args.video_dir,
+            exc,
+        )
+    finally:
+        event_buffer.clear(camera_id)
 
     logger.info("Pipeline finished: %s", stats)
     return 0 if stats.errors == 0 else 1
+
+
+def process_video_sequence(
+    video_paths: Sequence[Path],
+    camera_id: str,
+    args: argparse.Namespace,
+    yolo_detector: YoloCandidateDetector,
+    vlm_verifier: Optional[VideoVLMVerifier],
+    event_buffer: EventBuffer,
+    clip_builder: ClipBuilder,
+    stats: PipelineStats,
+    event_repository: Optional[EventRepository] = None,
+) -> None:
+    boundary_policy = _video_boundary_policy(args)
+    logger.info(
+        "Processing video sequence as one camera stream: camera_id=%s videos=%s boundary_policy=%s",
+        camera_id,
+        len(video_paths),
+        boundary_policy,
+    )
+
+    active_event: Optional[ActiveEvent] = None
+    cooldown_until_ms = -1
+    next_frame_id = 0
+    last_global_timestamp_ms: Optional[int] = None
+    last_frame_interval_ms: Optional[int] = None
+
+    for video_index, video_path in enumerate(video_paths):
+        if video_index > 0 and boundary_policy == "soft_reset":
+            if active_event is not None:
+                logger.info(
+                    "Finalizing partial event at soft video boundary: camera_id=%s candidate_id=%s",
+                    camera_id,
+                    active_event.candidate.get("candidate_id"),
+                )
+                finalize_event(
+                    active_event=active_event,
+                    vlm_verifier=vlm_verifier,
+                    clip_builder=clip_builder,
+                    args=args,
+                    stats=stats,
+                    event_repository=event_repository,
+                )
+                active_event = None
+            cooldown_until_ms = -1
+            event_buffer.clear(camera_id)
+            _reset_detector_state(yolo_detector)
+            next_frame_id = 0
+            last_global_timestamp_ms = None
+            last_frame_interval_ms = None
+
+        logger.info("Processing sequence segment: camera_id=%s source_uri=%s", camera_id, video_path)
+
+        source = FileVideoSource(
+            camera_id=camera_id,
+            source_uri=str(video_path),
+            fps_limit=args.fps_limit,
+            realtime=args.realtime,
+            loop=False,
+        )
+        previous_source_timestamp_ms: Optional[int] = None
+
+        try:
+            source.open()
+            while True:
+                packet = source.read()
+                if packet is None:
+                    break
+
+                packet = _normalize_sequence_packet(
+                    packet=packet,
+                    camera_id=camera_id,
+                    source_uri=str(video_path),
+                    next_frame_id=next_frame_id,
+                    previous_source_timestamp_ms=previous_source_timestamp_ms,
+                    last_global_timestamp_ms=last_global_timestamp_ms,
+                    last_frame_interval_ms=last_frame_interval_ms,
+                )
+                next_frame_id += 1
+
+                source_timestamp_ms = int(packet["source_timestamp_ms"])
+                timestamp_ms = int(packet["timestamp_ms"])
+                if previous_source_timestamp_ms is not None:
+                    last_frame_interval_ms = max(1, source_timestamp_ms - previous_source_timestamp_ms)
+                else:
+                    last_frame_interval_ms = _packet_frame_interval_ms(packet, last_frame_interval_ms)
+                previous_source_timestamp_ms = source_timestamp_ms
+                last_global_timestamp_ms = timestamp_ms
+
+                stats.frames_read += 1
+                event_buffer.append(packet)
+
+                if active_event is not None:
+                    active_event.append(packet)
+                    if timestamp_ms >= active_event.end_timestamp_ms:
+                        finalize_event(
+                            active_event=active_event,
+                            vlm_verifier=vlm_verifier,
+                            clip_builder=clip_builder,
+                            args=args,
+                            stats=stats,
+                            event_repository=event_repository,
+                        )
+                        cooldown_until_ms = timestamp_ms + int(args.cooldown_seconds * 1000)
+                        active_event = None
+                    continue
+
+                if timestamp_ms < cooldown_until_ms:
+                    continue
+
+                candidates = yolo_detector.detect(packet)
+                if not candidates:
+                    continue
+
+                stats.yolo_candidates += len(candidates)
+                candidate = max(candidates, key=lambda item: item["score"])
+                active_event = start_active_event(
+                    candidate=candidate,
+                    event_buffer=event_buffer,
+                    camera_id=camera_id,
+                    pre_event_seconds=args.pre_event_seconds,
+                    post_event_seconds=args.post_event_seconds,
+                )
+                logger.info(
+                    "YOLO candidate: camera_id=%s candidate_id=%s score=%.3f "
+                    "timestamp_ms=%s frames_buffered=%s",
+                    camera_id,
+                    candidate.get("candidate_id"),
+                    float(candidate.get("score", 0.0)),
+                    candidate.get("timestamp_ms"),
+                    len(active_event.frames),
+                )
+        finally:
+            source.close()
+
+        stats.videos_processed += 1
+
+    if active_event is not None:
+        logger.info(
+            "Finalizing partial event at end of video sequence: camera_id=%s candidate_id=%s",
+            camera_id,
+            active_event.candidate.get("candidate_id"),
+        )
+        finalize_event(
+            active_event=active_event,
+            vlm_verifier=vlm_verifier,
+            clip_builder=clip_builder,
+            args=args,
+            stats=stats,
+            event_repository=event_repository,
+        )
 
 
 def process_video_file(
@@ -248,6 +397,71 @@ def process_video_file(
             )
     finally:
         source.close()
+
+
+def _normalize_sequence_packet(
+    packet: Dict[str, Any],
+    camera_id: str,
+    source_uri: str,
+    next_frame_id: int,
+    previous_source_timestamp_ms: Optional[int],
+    last_global_timestamp_ms: Optional[int],
+    last_frame_interval_ms: Optional[int],
+) -> Dict[str, Any]:
+    normalized = dict(packet)
+    source_timestamp_ms = int(normalized.get("timestamp_ms", 0))
+
+    if last_global_timestamp_ms is None:
+        timestamp_ms = max(0, source_timestamp_ms)
+    elif previous_source_timestamp_ms is None:
+        timestamp_ms = last_global_timestamp_ms + _packet_frame_interval_ms(
+            normalized,
+            last_frame_interval_ms,
+        )
+    else:
+        timestamp_ms = last_global_timestamp_ms + max(
+            1,
+            source_timestamp_ms - previous_source_timestamp_ms,
+        )
+
+    normalized["camera_id"] = camera_id
+    normalized["frame_id"] = next_frame_id
+    normalized["timestamp_ms"] = timestamp_ms
+    normalized["source_uri"] = source_uri
+    normalized["source_timestamp_ms"] = source_timestamp_ms
+    return normalized
+
+
+def _packet_frame_interval_ms(
+    packet: Dict[str, Any],
+    fallback_ms: Optional[int],
+) -> int:
+    fps = packet.get("fps")
+    try:
+        fps_value = float(fps)
+    except (TypeError, ValueError):
+        fps_value = 0.0
+
+    if fps_value > 0:
+        return max(1, int(round(1000.0 / fps_value)))
+    if fallback_ms is not None:
+        return max(1, int(fallback_ms))
+    return int(round(1000.0 / FileVideoSource.DEFAULT_FPS))
+
+
+def _video_boundary_policy(args: argparse.Namespace) -> str:
+    policy = str(getattr(args, "video_boundary_policy", "soft_reset") or "soft_reset")
+    if policy not in {"soft_reset", "continuous"}:
+        raise ValueError(
+            "video_boundary_policy must be either 'soft_reset' or 'continuous'"
+        )
+    return policy
+
+
+def _reset_detector_state(yolo_detector: YoloCandidateDetector) -> None:
+    reset = getattr(yolo_detector, "reset_state", None)
+    if callable(reset):
+        reset()
 
 
 def start_active_event(
@@ -536,6 +750,7 @@ def _default_arg_values() -> Dict[str, Any]:
         "recursive": False,
         "max_videos": None,
         "camera_prefix": "file_cam",
+        "video_boundary_policy": "soft_reset",
         "fps_limit": 10.0,
         "realtime": False,
         "pre_event_seconds": 3.0,
@@ -611,6 +826,11 @@ def build_arg_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=defaults["recursive"])
     parser.add_argument("--max-videos", type=int, default=defaults["max_videos"])
     parser.add_argument("--camera-prefix", default=defaults["camera_prefix"])
+    parser.add_argument(
+        "--video-boundary-policy",
+        choices=["soft_reset", "continuous"],
+        default=defaults["video_boundary_policy"],
+    )
 
     parser.add_argument("--fps-limit", type=float, default=defaults["fps_limit"])
     parser.add_argument("--realtime", action=argparse.BooleanOptionalAction, default=defaults["realtime"])

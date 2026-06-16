@@ -118,13 +118,14 @@ class ClipBuilder:
 
         camera_id = _camera_id_from(candidate, frame_packets)
         category = category or _category_from_verification(verification)
-        event_id = event_id or self._make_event_id(camera_id, candidate)
-
-        clip_dir = self._event_dir(camera_id, category)
+        clip_dir = self._event_dir(camera_id)
         clip_dir.mkdir(parents=True, exist_ok=True)
 
-        clip_path = clip_dir / f"{event_id}{self.extension}"
-        metadata_path = clip_dir / f"{event_id}.json"
+        event_stem = self._next_event_stem(clip_dir)
+        event_id = event_id or self._make_event_id(camera_id, clip_dir.name, event_stem)
+
+        clip_path = clip_dir / f"{event_stem}{self.extension}"
+        metadata_path = clip_dir / f"{event_stem}.json"
 
         fps = _select_fps(frame_packets)
         width, height = _select_frame_size(frame_packets)
@@ -211,16 +212,21 @@ class ClipBuilder:
         except OSError as exc:
             raise ClipBuilderError(f"Failed to write metadata: {metadata_path}") from exc
 
-    def _event_dir(self, camera_id: str, category: str) -> Path:
+    def _event_dir(self, camera_id: str) -> Path:
         today = datetime.now().strftime("%Y%m%d")
-        return self.output_dir / _safe_name(category) / _safe_name(camera_id) / today
+        return self.output_dir / _safe_name(camera_id) / today
 
-    def _make_event_id(self, camera_id: str, candidate: Dict[str, Any]) -> str:
-        candidate_id = str(candidate.get("candidate_id") or "")
-        timestamp_ms = candidate.get("timestamp_ms")
-        if timestamp_ms is None:
-            timestamp_ms = datetime.now().strftime("%H%M%S")
-        raw = f"event_{camera_id}_{candidate_id}_{timestamp_ms}"
+    def _next_event_stem(self, clip_dir: Path) -> str:
+        max_index = 0
+        pattern = re.compile(r"^event_(\d+)$")
+        for path in clip_dir.glob(f"event_*{self.extension}"):
+            match = pattern.match(path.stem)
+            if match:
+                max_index = max(max_index, int(match.group(1)))
+        return f"event_{max_index + 1}"
+
+    def _make_event_id(self, camera_id: str, date_dir: str, event_stem: str) -> str:
+        raw = f"{camera_id}_{date_dir}_{event_stem}"
         return _safe_name(raw)[:180]
 
 

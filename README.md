@@ -24,7 +24,7 @@
 当前已经实现的是摔倒检测主链路，达到原型演示阶段：
 
 - 从本地视频目录扫描输入视频。
-- 将本地视频模拟为摄像头帧流。
+- 将本地视频目录模拟为一路摄像头帧流，并支持视频边界软重置或严格连续拼接。
 - 使用 YOLO pose/person 模型检测疑似摔倒候选。
 - 缓存事件触发点前后的帧。
 - 可选使用 MiniCPM-V 等 Video VLM 复核候选事件。
@@ -64,18 +64,13 @@ fall_edge_gateway/
 ├── run_gateway.py                  # 摔倒检测流水线入口
 ├── config.py                       # 全局路径配置
 ├── configs/
-│   ├── detection_config.json       # 检测流程配置
-│   ├── camera_sources.json         # 摄像头配置预留
-│   └── storage_nodes.json          # 存储节点配置预留
+│   └── detection_config.json       # 检测流程配置
 ├── services/
 │   ├── file_video_source.py        # 本地视频帧流读取
 │   ├── event_buffer.py             # 事件前后帧缓存
 │   ├── yolo_candidate_detector.py  # YOLO 疑似摔倒候选检测
 │   ├── video_vlm_verifier.py       # Video VLM 复核
-│   ├── clip_builder.py             # 事件视频与元数据保存
-│   ├── video_encryptor.py          # 隐私加密模块预留
-│   ├── multi_node_storage.py       # 多节点存储模块预留
-│   └── ledger_service.py           # 防篡改账本模块预留
+│   └── clip_builder.py             # 事件视频与元数据保存
 ├── data/
 │   ├── test_videos/                # 测试视频数据
 │   └── events/                     # 事件输出目录
@@ -125,9 +120,10 @@ configs/detection_config.json
 
 | 配置项 | 作用 |
 |---|---|
-| `video_dir` | 输入视频目录 |
+| `video_dir` | 输入视频目录；目录下视频会按文件名顺序作为一路模拟摄像头输入 |
 | `output_dir` | 事件输出目录 |
-| `max_videos` | 最多处理的视频数量 |
+| `max_videos` | 该模拟摄像头最多串联处理的视频数量 |
+| `video_boundary_policy` | 视频边界策略；`soft_reset` 默认认为相邻视频无关，只保持摄像头 ID，帧号/时间戳/缓存/冷却/跟踪状态都会重置；`continuous` 严格连续拼接 |
 | `fps_limit` | 限制检测帧率，降低计算量 |
 | `pre_event_seconds` | 保存事件触发前多少秒 |
 | `post_event_seconds` | 保存事件触发后多少秒 |
@@ -161,11 +157,44 @@ conda run -n DL1 python run_gateway.py --config configs/detection_config.json --
 conda run -n DL1 python run_gateway.py --video-dir data\test_videos\multiple\dataset\chute24 --max-videos 1
 ```
 
+如果目录下视频确实是同一摄像头连续切分出的片段，可以启用严格连续拼接：
+
+```powershell
+conda run -n DL1 python run_gateway.py --video-boundary-policy continuous
+```
+
 提高日志详细程度：
 
 ```powershell
 conda run -n DL1 python run_gateway.py --log-level DEBUG
 ```
+
+## 前端演示
+
+项目提供一个本地只读前端，用于展示养老照护摄像头实时摔倒监测项目介绍、实时监测工作台、告警中心、摔倒事件记录、待复核告警、案例回放与评估和技术方案。
+
+启动前端：
+
+```powershell
+python app.py
+```
+
+默认访问地址：
+
+```text
+http://127.0.0.1:8000
+```
+
+首页是项目介绍页；实时监测工作台作为同级导航模块提供。当前原型使用本地视频模拟摄像头输入，因此实时监测页摄像头卡片使用占位画面，不展示持续实时流。后续接入 RTSP 或真实摄像头后，可以替换为实时视频画面。
+
+前端读取现有的 `data/events`、`data/records.db`、`configs/detection_config.json` 和指标报告数据。第一版前端不会启动 YOLO 或 VLM 推理任务，也不会修改事件数据。
+
+事件分类规则：
+
+- `confirmed_fall` 显示在“摔倒事件记录”，并让对应摄像头显示最高风险状态。
+- `candidates` 和 `need_human_review` 显示在“待复核告警”。
+- `rejected` 默认不展示事件列表，只在“案例回放与评估”中统计数量。
+- 当 `data/records.db` 存在时，前端优先使用 SQLite 中的事件状态。
 
 ## 输出结果
 
@@ -179,17 +208,21 @@ data/events/
 
 ```text
 data/events/
-└── confirmed_fall/
-    └── file_cam_001/
-        └── 20260604/
-            ├── event_xxx.mp4
-            └── event_xxx.json
+└── file_cam_001/
+    └── 20260616/
+        ├── event_1.mp4
+        ├── event_1.json
+        ├── event_2.mp4
+        └── event_2.json
 ```
+
+同一摄像头同一天内按已保存 mp4 数量递增命名；事件类别、候选信息和 VLM 复核结果只记录在 JSON 元数据中。
 
 事件元数据中包含：
 
 - 事件 ID
 - 摄像头 ID
+- 事件类别
 - 视频片段路径
 - 帧数量
 - 时间范围
@@ -208,6 +241,63 @@ data/events/
   "retention_status": "pending_manifest"
 }
 ```
+
+## 指标报告
+
+每次运行检测流程后，可以基于 `data/events` 下保存的事件元数据生成独立指标报告。报告文件用于查看本次运行结果，不需要把具体指标写回 README。
+
+生成默认报告：
+
+```powershell
+conda run -n DL1 python generate_metrics_report.py
+```
+
+默认输出：
+
+```text
+data/events/metrics_summary.json
+data/events/metrics_summary.md
+```
+
+指定事件目录和输出路径：
+
+```powershell
+conda run -n DL1 python generate_metrics_report.py `
+  --event-dir data/events `
+  --output-json data/events/demo_metrics.json `
+  --output-md data/events/demo_metrics.md
+```
+
+如果只想统计事件文件，不读取 SQLite 队列状态：
+
+```powershell
+conda run -n DL1 python generate_metrics_report.py --no-queue-db
+```
+
+报告会统计：
+
+- 事件总数、摄像头数、视频来源数。
+- candidates、confirmed_fall、rejected、need_human_review 等类别分布。
+- 保存片段的总时长、平均时长、帧数和 FPS。
+- YOLO 候选数量、平均候选分数。
+- VLM 复核数量、确认/拒绝/人工复核数量、平均置信度。
+- SQLite 队列中 pending、processing、done、failed 任务数量。
+
+Precision、Recall、F1 和时间准确率需要人工标注文件。标注 CSV 至少包含以下列：
+
+```csv
+source_uri,event_start_ms,event_end_ms
+source_a.mp4,1000,5000
+source_b.mp4,2200,7000
+```
+
+带标注文件生成评估报告：
+
+```powershell
+conda run -n DL1 python generate_metrics_report.py --labels-path data/labels/demo_labels.csv
+```
+
+其中时间准确率表示系统候选触发时间落在真实摔倒开始时间附近的比例，目前报告会给出 `within_1000ms` 和 `within_2000ms` 两档结果。未提供标注文件时，报告会明确标记这些准确率类指标未计算。
 
 ## 测试
 

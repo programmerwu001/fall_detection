@@ -220,9 +220,11 @@ vlm_processing
 候选事件保存路径建议：
 
 ```text
-data/events/candidates/{camera_id}/{yyyyMMdd}/{event_id}.mp4
-data/events/candidates/{camera_id}/{yyyyMMdd}/{event_id}.json
+data/events/{camera_id}/{yyyyMMdd}/event_N.mp4
+data/events/{camera_id}/{yyyyMMdd}/event_N.json
 ```
+
+同一摄像头同一天内按已保存 mp4 数量递增命名；候选状态通过 metadata 的 `category` 和数据库 `status` 表达，不体现在文件名或目录名里。
 
 候选 metadata 最少包含：
 
@@ -232,7 +234,7 @@ data/events/candidates/{camera_id}/{yyyyMMdd}/{event_id}.json
   "camera_id": "file_cam_001",
   "status": "vlm_pending",
   "source_uri": "input video or rtsp url",
-  "clip_path": "data/events/candidates/file_cam_001/20260605/event_xxx.mp4",
+  "clip_path": "data/events/file_cam_001/20260605/event_4.mp4",
   "candidate": {},
   "verification": null,
   "privacy_status": "raw_unprotected",
@@ -317,13 +319,9 @@ data/events/candidates/{camera_id}/{yyyyMMdd}/{event_id}.json
 
 方案 B：VLM 完成后移动到分类目录。
 
-```text
-data/events/confirmed_fall/{camera_id}/{yyyyMMdd}/{event_id}.mp4
-data/events/rejected/{camera_id}/{yyyyMMdd}/{event_id}.mp4
-data/events/need_human_review/{camera_id}/{yyyyMMdd}/{event_id}.mp4
-```
+不采用。文件位置固定为 `data/events/{camera_id}/{yyyyMMdd}/event_N.*`，分类结果写入 JSON 和数据库，避免移动文件造成索引、队列和审计链路不一致。
 
-推荐第一阶段采用方案 A，降低实现复杂度。需要人工查看目录时，再增加只读索引或导出命令。若采用方案 B，移动文件和更新数据库必须在同一逻辑事务内处理，失败时要能恢复。
+推荐第一阶段采用方案 A，降低实现复杂度。需要人工查看目录时，再增加只读索引或导出命令。
 
 ### 6.8 失败与恢复流程
 
@@ -504,8 +502,9 @@ ON vlm_jobs(status, priority, created_at);
 | `vlm_max_retries` | int | `2` | VLM job 最大重试次数。 |
 | `queue_max_pending` | int | `100` | pending 任务积压阈值。 |
 | `queue_backpressure_policy` | string | `keep_high_score` | 队列积压时的降级策略。 |
-| `candidate_output_dir` | string | `data/events/candidates` | 候选事件输出目录。 |
+| `candidate_output_dir` | string | `data/events` | 候选事件输出根目录。实际保存到 `{camera_id}/{yyyyMMdd}`。 |
 | `archive_by_result` | bool | `false` | VLM 完成后是否按结果移动文件。 |
+| `video_boundary_policy` | string | `soft_reset` | 本地视频目录模拟摄像头时的视频边界策略。`soft_reset` 默认认为相邻视频无关，只保持 camera_id，帧号、时间戳、缓存、冷却和跟踪状态都会重置；`continuous` 严格连续拼接。 |
 
 保留配置项：
 
@@ -543,9 +542,9 @@ ON vlm_jobs(status, priority, created_at);
 
 改造方向：
 
-- 支持保存候选事件 category，例如 `candidates`。
+- 支持保存候选事件 category，例如 `candidates`，但 category 只写入 metadata。
 - 支持 `verification=None`。
-- 支持以传入 `event_id` 写入稳定文件名。
+- 支持按摄像头和日期目录递增生成 `event_N` 文件名。
 
 ### 10.3 `services/event_repository.py`
 
@@ -598,9 +597,10 @@ conda run -n DL1 python run_gateway.py --config configs/detection_config.json --
 预期行为：
 
 - 持续读取摄像头或视频帧。
-- 发现候选事件后保存到 `data/events/candidates`。
+- 发现候选事件后保存到 `data/events/{camera_id}/{yyyyMMdd}`。
 - 将任务写入 `data/records.db`。
 - 不等待 VLM 结果。
+- 默认使用 `soft_reset` 处理本地视频边界，认为相邻视频互不相关，避免前一个视频污染下一个视频的时间轴、事件缓存和 VLM 片段；只有确认视频来自同一路摄像头连续切分时才使用 `continuous`。
 
 ### 11.2 VLM Worker
 
@@ -755,7 +755,7 @@ conda run -n DL1 python -m unittest discover -s tests
 ### 阶段 5：部署验证
 
 - 用本地测试视频验证完整链路。
-- 用多路本地视频模拟多摄像头。
+- 用多个本地视频目录模拟多摄像头；单个目录内的视频按顺序模拟同一路摄像头，默认在视频边界软重置。
 - 接入 RTSP 后验证长时间运行稳定性。
 
 ## 18. 设计取舍

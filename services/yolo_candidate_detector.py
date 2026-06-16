@@ -201,6 +201,11 @@ class YoloCandidateDetector:
             "candidate_threshold": self.candidate_threshold,
         }
 
+    def reset_state(self) -> None:
+        """Clear cross-frame tracking state at a known stream boundary."""
+        self._tracks.clear()
+        self._next_track_id = 1
+
     def _predict(self, frame: Any) -> Sequence[Any]:
         kwargs: Dict[str, Any] = {
             "source": frame,

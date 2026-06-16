@@ -75,6 +75,16 @@ class YoloCandidateDetectorTest(unittest.TestCase):
         self.assertIsNotNone(first)
         self.assertIsNone(second)
 
+    def test_reset_state_clears_tracking_between_video_segments(self):
+        detector = YoloCandidateDetector()
+        detector._tracks[7] = object()
+        detector._next_track_id = 8
+
+        detector.reset_state()
+
+        self.assertEqual(detector.get_state()["tracked_person_count"], 0)
+        self.assertEqual(detector.get_state()["next_track_id"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

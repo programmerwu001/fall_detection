@@ -75,8 +75,59 @@ class ClipBuilderTest(unittest.TestCase):
 
             metadata = json.loads(Path(saved["metadata_path"]).read_text(encoding="utf-8"))
             self.assertEqual(saved["category"], "candidates")
-            self.assertIn("candidates", saved["clip_path"])
+            self.assertEqual(Path(saved["clip_path"]).parent.parent.name, "cam1")
+            self.assertEqual(Path(saved["clip_path"]).stem, "event_1")
             self.assertIsNone(metadata["verification"])
+
+    def test_save_clip_uses_camera_date_directory_and_next_daily_sequence_name(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            builder = ClipBuilder(output_dir=temp_dir)
+            existing_dir = Path(temp_dir) / "file_cam_001" / "20260616"
+            existing_dir.mkdir(parents=True)
+            for index in range(1, 4):
+                (existing_dir / f"event_{index}.mp4").write_bytes(b"existing")
+
+            candidate = {
+                "camera_id": "file_cam_001",
+                "candidate_id": "candidate-with-extra-info",
+                "timestamp_ms": 12345,
+            }
+            frame = np.zeros((16, 16, 3), dtype=np.uint8)
+            frames = [
+                {
+                    "camera_id": "file_cam_001",
+                    "frame_id": 1,
+                    "timestamp_ms": 12345,
+                    "frame": frame,
+                    "width": 16,
+                    "height": 16,
+                    "fps": 5,
+                    "source_uri": "video.mp4",
+                }
+            ]
+
+            with (
+                patch("services.clip_builder.cv2", FakeCv2),
+                patch("services.clip_builder.datetime") as fake_datetime,
+            ):
+                fake_datetime.now.return_value.strftime.return_value = "20260616"
+                fake_datetime.now.return_value.isoformat.return_value = "2026-06-16T09:30:00"
+                saved = builder.save_event_clip(
+                    candidate=candidate,
+                    verification={"result": "confirmed_fall"},
+                    frame_packets=frames,
+                    category="confirmed_fall",
+                )
+
+            clip_path = Path(saved["clip_path"])
+            metadata_path = Path(saved["metadata_path"])
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(clip_path, existing_dir / "event_4.mp4")
+        self.assertEqual(metadata_path, existing_dir / "event_4.json")
+        self.assertEqual(saved["event_id"], "file_cam_001_20260616_event_4")
+        self.assertEqual(metadata["category"], "confirmed_fall")
+        self.assertEqual(metadata["candidate"]["candidate_id"], "candidate-with-extra-info")
 
 
 if __name__ == "__main__":

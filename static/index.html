@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>养老照护摄像头实时摔倒监测演示平台</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand-block">
+        <p class="eyebrow">Fall Edge Gateway</p>
+        <h1>养老照护摄像头实时摔倒监测演示平台</h1>
+        <p class="subtitle">
+          基于 YOLO 候选检测与 Video VLM 复核的摄像头风险告警原型
+        </p>
+      </div>
+      <nav class="main-nav" aria-label="主导航">
+        <a href="#page=intro" data-page-link="intro">项目介绍</a>
+        <a href="#page=monitoring" data-page-link="monitoring">实时监测</a>
+        <a href="#page=alerts" data-page-link="alerts">告警中心</a>
+        <a href="#page=fall-events" data-page-link="fall-events">摔倒事件记录</a>
+        <a href="#page=review-alerts" data-page-link="review-alerts">待复核告警</a>
+        <a href="#page=showcase-evaluation" data-page-link="showcase-evaluation">案例回放与评估</a>
+        <a href="#page=architecture" data-page-link="architecture">技术方案</a>
+      </nav>
+    </header>
+
+    <main>
+      <section id="intro" class="page-view section hero-section" data-page="intro"></section>
+      <section id="monitoring" class="page-view section" data-page="monitoring"></section>
+      <section id="alerts" class="page-view section" data-page="alerts"></section>
+      <section id="fall-events" class="page-view section" data-page="fall-events"></section>
+      <section id="review-alerts" class="page-view section" data-page="review-alerts"></section>
+      <section id="showcase-evaluation" class="page-view section" data-page="showcase-evaluation"></section>
+      <section id="architecture" class="page-view section" data-page="architecture"></section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
