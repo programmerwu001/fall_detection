@@ -1,0 +1,32 @@
+#
+# Fall Edge Gateway runtime dependencies.
+#
+# For GPU servers, install PyTorch with the CUDA wheel that matches the server
+# before or together with this file. Example:
+#   pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio
+# For CPU-only verification:
+#   pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
+#
+# The torch entries below are intentionally version-ranged. If you install
+# PyTorch separately with a CUDA index URL, pip will satisfy these requirements
+# from the already installed packages.
+
+torch>=2.3.0,<=2.8.0
+torchvision>=0.18.0,<=0.23.0
+torchaudio<=2.8.0
+
+accelerate>=0.30.0
+av>=12.0.0
+decord>=0.6.0
+einops>=0.7.0
+huggingface-hub>=0.23.0
+minicpmo-utils>=1.0.5
+numpy>=1.24.0,<2.0.0
+opencv-python-headless>=4.8.0,<5.0.0
+Pillow>=10.0.0,<12.0.0
+protobuf>=4.25.0
+safetensors>=0.4.0
+sentencepiece>=0.2.0
+timm>=0.9.0
+transformers>=4.51.0
+ultralytics>=8.3.0,<9.0.0

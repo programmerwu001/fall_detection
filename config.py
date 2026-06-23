@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-LOCAL_VLM_MODEL_DIR = BASE_DIR.parent / "models" / "MiniCPM-V-4.6"
+LOCAL_VLM_MODEL_DIR = BASE_DIR / "models" / "MiniCPM-V-4.6"
 DEFAULT_VLM_MODEL = os.environ.get(
     "FALL_GATEWAY_VLM_MODEL",
     str(LOCAL_VLM_MODEL_DIR)
