@@ -265,7 +265,7 @@ def _standardize_event(
         or "pending_manifest"
     )
     duration_ms = _safe_float(metadata.get("duration_ms"))
-    media_url = f"/media/{media_token_for_path(clip_path)}" if clip_path else None
+    media_url = _media_url_for_path(clip_path) if clip_path else None
 
     return {
         "event_id": event_id,
@@ -330,6 +330,15 @@ def _display_status(raw_status: str, fallback_category: Any = None) -> str:
     }:
         return "confirmed_fall"
     return str(fallback_category or "candidates")
+
+
+def _media_url_for_path(path: str | Path) -> str:
+    token = media_token_for_path(path)
+    try:
+        version = Path(path).stat().st_mtime_ns
+    except OSError:
+        return f"/media/{token}"
+    return f"/media/{token}?v={version}"
 
 
 def _camera_card(camera_id: str, camera_events: list[dict]) -> dict:

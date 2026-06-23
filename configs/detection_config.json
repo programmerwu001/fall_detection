@@ -31,10 +31,10 @@
     "log_level": "日志级别，例如 DEBUG、INFO、WARNING、ERROR。"
   },
   "config": "configs/detection_config.json",
-  "video_dir": "E:\\viedo_vlm\\fall_edge_gateway\\data\\test_videos\\le2i\\Coffee_room_02\\Coffee_room_02\\Videos",
+  "video_dir": "E:\\viedo_vlm\\fall_edge_gateway\\data\\test_videos\\Dataset CAUCAFall\\CAUCAFall\\test_videos",
   "output_dir": "E:\\viedo_vlm\\fall_edge_gateway\\data\\events",
-  "recursive": false,
-  "max_videos": 22,
+  "recursive": true,
+  "max_videos": null,
   "camera_prefix": "file_cam",
   "video_boundary_policy": "soft_reset",
   "fps_limit": 15,

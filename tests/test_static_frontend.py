@@ -35,14 +35,32 @@ class StaticFrontendTest(unittest.TestCase):
         self.assertIn("function setActivePage", js)
         self.assertIn("window.addEventListener(\"hashchange\"", js)
 
-    def test_event_lists_have_display_limits_and_show_more_controls(self):
+    def test_event_lists_have_pagination_controls(self):
         js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
 
-        self.assertIn("const EVENT_PAGE_SIZE = 8", js)
-        self.assertIn("visibleLimits", js)
-        self.assertIn("function limitedEvents", js)
-        self.assertIn("function renderShowMore", js)
-        self.assertIn("function showMore", js)
+        self.assertIn("const EVENT_PAGE_SIZE = 4", js)
+        self.assertIn("eventPages", js)
+        self.assertIn("function pagedEvents", js)
+        self.assertIn("function renderEventPagination", js)
+        self.assertIn("function setEventPage", js)
+
+    def test_event_table_uses_pagination_not_show_more(self):
+        js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        table_start = js.index("function renderEventTable")
+        table_end = js.index("async function renderEventDetail")
+        event_table = js[table_start:table_end]
+
+        self.assertIn("pagedEvents", event_table)
+        self.assertIn("renderEventPagination", event_table)
+        self.assertIn("paginated-list", event_table)
+        self.assertNotIn("renderShowMore", event_table)
+
+    def test_css_supports_paginated_event_lists(self):
+        css = (ROOT / "static" / "styles.css").read_text(encoding="utf-8")
+
+        self.assertIn(".paginated-list", css)
+        self.assertIn(".pagination-row", css)
+        self.assertIn(".page-button", css)
 
     def test_intro_copy_presents_camera_project_not_local_video_mock(self):
         js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
@@ -88,6 +106,35 @@ class StaticFrontendTest(unittest.TestCase):
         self.assertIn("事件证据", detail)
         self.assertIn("关键判断", detail)
         self.assertIn("安全留存", detail)
+
+    def test_latest_alerts_open_visible_alert_detail(self):
+        js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        latest_start = js.index("function renderLatestAlerts")
+        latest_end = js.index("function renderQueueSummary")
+        latest_alerts = js[latest_start:latest_end]
+
+        self.assertIn("openAlertFromQueue", latest_alerts)
+        self.assertIn("function openAlertFromQueue", js)
+        self.assertIn("window.openAlertFromQueue", js)
+        self.assertIn('state.activeAlertFilter = "all"', js)
+
+    def test_detail_panel_has_triage_summary(self):
+        js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        detail_start = js.index("async function renderEventDetail")
+        detail_end = js.index("function renderEvaluationCards")
+        detail = js[detail_start:detail_end]
+
+        self.assertIn("decision-summary", detail)
+        self.assertIn("当前结论", detail)
+        self.assertIn("复核置信度", detail)
+        self.assertIn("证据状态", detail)
+
+    def test_css_supports_polished_alert_detail_layout(self):
+        css = (ROOT / "static" / "styles.css").read_text(encoding="utf-8")
+
+        self.assertIn(".decision-summary", css)
+        self.assertIn(".detail-panel.sticky-detail", css)
+        self.assertIn(".event-row::before", css)
 
 
 if __name__ == "__main__":

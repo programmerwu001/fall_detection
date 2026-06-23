@@ -82,6 +82,64 @@ def guess_content_type(filename: str) -> str:
     return "application/octet-stream"
 
 
+def parse_byte_range(range_header: str, file_size: int) -> tuple[int, int] | None:
+    """解析单段 HTTP Range 头，返回闭区间字节范围。"""
+    if file_size <= 0 or not range_header.startswith("bytes="):
+        return None
+    range_spec = range_header[len("bytes=") :].strip()
+    if "," in range_spec:
+        return None
+    start_text, separator, end_text = range_spec.partition("-")
+    if separator != "-":
+        return None
+    if not start_text:
+        if not end_text.isdigit():
+            return None
+        suffix_length = int(end_text)
+        if suffix_length <= 0:
+            return None
+        start = max(file_size - suffix_length, 0)
+        end = file_size - 1
+    else:
+        if not start_text.isdigit() or (end_text and not end_text.isdigit()):
+            return None
+        start = int(start_text)
+        end = int(end_text) if end_text else file_size - 1
+        if start >= file_size or start > end:
+            return None
+        end = min(end, file_size - 1)
+    return start, end
+
+
+def create_media_response(
+    file_path: Path,
+    range_header: str | None = None,
+) -> tuple[int, dict[str, str], bytes]:
+    """创建支持字节范围请求的视频响应。"""
+    file_size = file_path.stat().st_size
+    headers = {
+        "Content-Type": guess_content_type(file_path.name),
+        "Accept-Ranges": "bytes",
+    }
+    if range_header:
+        byte_range = parse_byte_range(range_header, file_size)
+        if byte_range is None:
+            headers["Content-Range"] = f"bytes */{file_size}"
+            headers["Content-Length"] = "0"
+            return 416, headers, b""
+        start, end = byte_range
+        with file_path.open("rb") as file:
+            file.seek(start)
+            body = file.read(end - start + 1)
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+        headers["Content-Length"] = str(len(body))
+        return 206, headers, body
+
+    body = file_path.read_bytes()
+    headers["Content-Length"] = str(len(body))
+    return 200, headers, body
+
+
 class FrontendRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -161,15 +219,11 @@ class FrontendRequestHandler(BaseHTTPRequestHandler):
 
     def _send_media(self, token: str) -> None:
         file_path = resolve_media_token(unquote(token), EVENT_DIR)
-        body = file_path.read_bytes()
-        self._send_response(
-            200,
-            {
-                "Content-Type": guess_content_type(file_path.name),
-                "Content-Length": str(len(body)),
-            },
-            body,
+        status, headers, body = create_media_response(
+            file_path,
+            self.headers.get("Range"),
         )
+        self._send_response(status, headers, body)
 
     def _send_json(self, payload: dict, status: int = 200) -> None:
         response_status, headers, body = create_api_response(payload, status)

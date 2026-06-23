@@ -11,6 +11,12 @@ const state = {
   selectedShowcaseId: null,
   activeAlertFilter: "all",
   activeShowcaseFilter: "all",
+  eventPages: {
+    alerts: 0,
+    fallEvents: 0,
+    reviewAlerts: 0,
+    showcase: 0,
+  },
   visibleLimits: {
     latestAlerts: 8,
     alerts: 8,
@@ -38,7 +44,7 @@ const pages = [
   "architecture",
 ];
 
-const EVENT_PAGE_SIZE = 8;
+const EVENT_PAGE_SIZE = 4;
 
 const reviewStatuses = new Set(["candidates", "need_human_review"]);
 
@@ -321,7 +327,7 @@ function renderLatestAlerts(alerts) {
       ${visible
         .map(
           (event) => `
-            <button class="alert-item" type="button" onclick="selectAlert('${escapeAttr(event.event_id)}')">
+            <button class="alert-item" type="button" onclick="openAlertFromQueue('${escapeAttr(event.event_id)}')">
               <div class="row-top">
                 <span class="row-title">${escapeHtml(event.camera_id || "未知摄像头")}</span>
                 ${badge(event.display_status)}
@@ -371,12 +377,7 @@ function renderAlertsCenter() {
     ["need_human_review", "待复核"],
     ["candidates", "疑似摔倒"],
   ];
-  const events = state.alerts.filter((event) => {
-    return (
-      state.activeAlertFilter === "all" ||
-      event.display_status === state.activeAlertFilter
-    );
-  });
+  const events = filteredAlerts();
   document.querySelector("#alerts").innerHTML = `
     <div class="section-header">
       <p class="eyebrow">Alert center</p>
@@ -394,7 +395,7 @@ function renderAlertsCenter() {
     </div>
     <div class="event-layout">
       <div>${renderEventTable(events, state.selectedAlertId, "selectAlert", "alerts")}</div>
-      <div class="detail-panel" id="alert-detail"></div>
+      <div class="detail-panel sticky-detail" id="alert-detail"></div>
     </div>
   `;
   renderEventDetail("#alert-detail", state.selectedAlertId);
@@ -420,7 +421,7 @@ function renderFallEvents() {
     </div>
     <div class="event-layout">
       <div>${renderEventTable(state.fallEvents, state.selectedFallEventId, "selectFallEvent", "fallEvents")}</div>
-      <div class="detail-panel" id="fall-event-detail"></div>
+      <div class="detail-panel sticky-detail" id="fall-event-detail"></div>
     </div>
     <div class="note">该模块后续适合加入访问控制。第一版只展示状态，不实现登录、授权或解密。</div>
   `;
@@ -447,7 +448,7 @@ function renderReviewAlerts() {
     </div>
     <div class="event-layout">
       <div>${renderEventTable(state.reviewAlerts, state.selectedReviewAlertId, "selectReviewAlert", "reviewAlerts")}</div>
-      <div class="detail-panel" id="review-alert-detail"></div>
+      <div class="detail-panel sticky-detail" id="review-alert-detail"></div>
     </div>
     <div class="note">第一版不提供通过、拒绝或提交审核结果按钮，只为后续人工审核流程预留位置。</div>
   `;
@@ -472,13 +473,7 @@ function renderShowcaseEvaluation() {
     ["review", "待 VLM/人工复核"],
     ["need_human_review", "需人工复核"],
   ];
-  const cases = state.showcaseCases.filter((event) => {
-    if (state.activeShowcaseFilter === "all") return true;
-    if (state.activeShowcaseFilter === "review") {
-      return reviewStatuses.has(event.display_status);
-    }
-    return event.display_status === state.activeShowcaseFilter;
-  });
+  const cases = filteredShowcaseCases();
   document.querySelector("#showcase-evaluation").innerHTML = `
     <div class="section-header">
       <p class="eyebrow">Showcase and evaluation</p>
@@ -511,26 +506,28 @@ function renderEventTable(events, selectedId, onSelectName, limitKey) {
   if (!events.length) {
     return `<div class="empty-state">当前暂无可展示记录。</div>`;
   }
-  const visible = limitedEvents(events, limitKey);
+  const visible = pagedEvents(events, limitKey);
   return `
-    <div class="event-list">
-      ${visible
-        .map(
-          (event) => `
-            <button class="event-row ${event.event_id === selectedId ? "active" : ""}" type="button" onclick="${onSelectName}('${escapeAttr(event.event_id)}')">
-              <div class="row-top">
-                <span class="row-title">${escapeHtml(event.event_id)}</span>
-                ${badge(event.display_status)}
-              </div>
-              <div class="row-meta">${escapeHtml(event.camera_id || "未知摄像头")} · ${escapeHtml(event.area_label || "模拟区域")}</div>
-              <div class="row-meta">${escapeHtml(event.created_at || "时间未记录")}</div>
-              ${renderEvidenceRail(event)}
-            </button>
-          `,
-        )
-        .join("")}
+    <div class="paginated-list">
+      <div class="event-list">
+        ${visible
+          .map(
+            (event) => `
+              <button class="event-row ${event.event_id === selectedId ? "active" : ""}" type="button" onclick="${onSelectName}('${escapeAttr(event.event_id)}')">
+                <div class="row-top">
+                  <span class="row-title">${escapeHtml(event.event_id)}</span>
+                  ${badge(event.display_status)}
+                </div>
+                <div class="row-meta">${escapeHtml(event.camera_id || "未知摄像头")} · ${escapeHtml(event.area_label || "模拟区域")}</div>
+                <div class="row-meta">${escapeHtml(event.created_at || "时间未记录")}</div>
+                ${renderEvidenceRail(event)}
+              </button>
+            `,
+          )
+          .join("")}
+      </div>
+      ${renderEventPagination(limitKey, events.length)}
     </div>
-    ${renderShowMore(limitKey, events.length, rerenderNameForLimit(limitKey))}
   `;
 }
 
@@ -548,6 +545,13 @@ async function renderEventDetail(containerSelector, eventId) {
     const candidate = detail.candidate || {};
     const verification = detail.verification || {};
     const status = detail.status_explanations || {};
+    const displayStatus = event.display_status || event.status || "normal";
+    const currentDecision =
+      event.status_label || labels[displayStatus] || displayStatus;
+    const reviewConfidence =
+      verification.confidence ?? event.vlm_confidence ?? "未记录";
+    const evidenceStatus =
+      status.integrity_status || event.integrity_label || "未记录";
     const media = event.media_url
       ? `<video class="video-player" controls preload="metadata" src="${escapeAttr(event.media_url)}"></video>`
       : `<div class="camera-placeholder empty-video">暂无可播放片段</div>`;
@@ -557,11 +561,25 @@ async function renderEventDetail(containerSelector, eventId) {
           <p class="eyebrow">事件证据</p>
           <h3>${escapeHtml(event.event_id || "事件详情")}</h3>
         </div>
-        ${badge(event.display_status || event.status)}
+        ${badge(displayStatus)}
+      </div>
+      <div class="decision-summary" aria-label="事件判断摘要">
+        <div class="decision-summary-item">
+          <span>当前结论</span>
+          <strong>${escapeHtml(currentDecision)}</strong>
+        </div>
+        <div class="decision-summary-item">
+          <span>复核置信度</span>
+          <strong>${formatNumber(reviewConfidence)}</strong>
+        </div>
+        <div class="decision-summary-item">
+          <span>证据状态</span>
+          <strong>${escapeHtml(evidenceStatus)}</strong>
+        </div>
       </div>
       <div class="detail-media">${media}</div>
       ${renderEvidenceRail({
-        display_status: event.display_status || event.status,
+        display_status: displayStatus,
         yolo_score: event.yolo_score || candidate.score,
         vlm_result: verification.result || event.vlm_result,
       })}
@@ -765,22 +783,16 @@ function escapeAttr(value) {
 
 function setAlertFilter(value) {
   state.activeAlertFilter = value;
-  resetVisibleLimit("alerts");
-  const events = state.alerts.filter((event) => {
-    return value === "all" || event.display_status === value;
-  });
+  resetEventPage("alerts");
+  const events = filteredAlerts();
   state.selectedAlertId = events[0]?.event_id || null;
   renderAlertsCenter();
 }
 
 function setShowcaseFilter(value) {
   state.activeShowcaseFilter = value;
-  resetVisibleLimit("showcase");
-  const cases = state.showcaseCases.filter((event) => {
-    if (value === "all") return true;
-    if (value === "review") return reviewStatuses.has(event.display_status);
-    return event.display_status === value;
-  });
+  resetEventPage("showcase");
+  const cases = filteredShowcaseCases();
   state.selectedShowcaseId = cases[0]?.event_id || null;
   renderShowcaseEvaluation();
 }
@@ -788,6 +800,18 @@ function setShowcaseFilter(value) {
 function selectAlert(eventId) {
   state.selectedAlertId = eventId;
   renderAlertsCenter();
+}
+
+function openAlertFromQueue(eventId) {
+  state.activeAlertFilter = "all";
+  setEventPageForSelection("alerts", eventId);
+  state.selectedAlertId = eventId;
+  renderAlertsCenter();
+  if (window.location.hash === "#page=alerts") {
+    setActivePage("alerts");
+    return;
+  }
+  window.location.hash = "#page=alerts";
 }
 
 function selectFallEvent(eventId) {
@@ -808,6 +832,123 @@ function selectShowcase(eventId) {
 function limitedEvents(events, limitKey) {
   const limit = state.visibleLimits[limitKey] || EVENT_PAGE_SIZE;
   return events.slice(0, limit);
+}
+
+function filteredAlerts() {
+  return state.alerts.filter((event) => {
+    return (
+      state.activeAlertFilter === "all" ||
+      event.display_status === state.activeAlertFilter
+    );
+  });
+}
+
+function filteredShowcaseCases() {
+  return state.showcaseCases.filter((event) => {
+    if (state.activeShowcaseFilter === "all") return true;
+    if (state.activeShowcaseFilter === "review") {
+      return reviewStatuses.has(event.display_status);
+    }
+    return event.display_status === state.activeShowcaseFilter;
+  });
+}
+
+function eventsForPageKey(pageKey) {
+  const eventGroups = {
+    alerts: filteredAlerts,
+    fallEvents: () => state.fallEvents,
+    reviewAlerts: () => state.reviewAlerts,
+    showcase: filteredShowcaseCases,
+  };
+  const getter = eventGroups[pageKey];
+  return typeof getter === "function" ? getter() : [];
+}
+
+function pagedEvents(events, pageKey) {
+  const page = normalizedEventPage(pageKey, events.length);
+  const start = page * EVENT_PAGE_SIZE;
+  return events.slice(start, start + EVENT_PAGE_SIZE);
+}
+
+function normalizedEventPage(pageKey, totalCount) {
+  const pageCount = Math.max(1, Math.ceil(totalCount / EVENT_PAGE_SIZE));
+  const current = state.eventPages[pageKey] || 0;
+  const page = Math.min(Math.max(current, 0), pageCount - 1);
+  state.eventPages[pageKey] = page;
+  return page;
+}
+
+function renderEventPagination(pageKey, totalCount) {
+  const pageCount = Math.ceil(totalCount / EVENT_PAGE_SIZE);
+  if (pageCount <= 1) {
+    return "";
+  }
+  const page = normalizedEventPage(pageKey, totalCount);
+  const rerenderName = rerenderNameForLimit(pageKey);
+  const pageButtons = Array.from({ length: pageCount }, (_, index) => {
+    const label = `第 ${index + 1} 页`;
+    return `
+      <button class="page-button ${index === page ? "active" : ""}" type="button" onclick="setEventPage('${pageKey}', ${index}, '${rerenderName}')" aria-label="${label}" ${index === page ? 'aria-current="page"' : ""}>
+        ${index + 1}
+      </button>
+    `;
+  }).join("");
+  return `
+    <div class="pagination-row" aria-label="列表分页">
+      <button class="page-button" type="button" onclick="setEventPage('${pageKey}', ${page - 1}, '${rerenderName}')" ${page === 0 ? "disabled" : ""}>
+        上一页
+      </button>
+      <div class="page-buttons">${pageButtons}</div>
+      <button class="page-button" type="button" onclick="setEventPage('${pageKey}', ${page + 1}, '${rerenderName}')" ${page >= pageCount - 1 ? "disabled" : ""}>
+        下一页
+      </button>
+      <span>第 ${page + 1} / ${pageCount} 页，共 ${totalCount} 条</span>
+    </div>
+  `;
+}
+
+function setEventPage(pageKey, page, rerenderName) {
+  const events = eventsForPageKey(pageKey);
+  const pageCount = Math.max(1, Math.ceil(events.length / EVENT_PAGE_SIZE));
+  state.eventPages[pageKey] = Math.min(Math.max(page, 0), pageCount - 1);
+  selectFirstEventOnCurrentPage(pageKey);
+  const rerender = window[rerenderName];
+  if (typeof rerender === "function") {
+    rerender();
+  }
+}
+
+function selectFirstEventOnCurrentPage(pageKey) {
+  const event = pagedEvents(eventsForPageKey(pageKey), pageKey)[0] || null;
+  setSelectedEventForPageKey(pageKey, event?.event_id || null);
+}
+
+function setEventPageForSelection(pageKey, eventId) {
+  const events = eventsForPageKey(pageKey);
+  const index = events.findIndex((event) => event.event_id === eventId);
+  state.eventPages[pageKey] =
+    index >= 0 ? Math.floor(index / EVENT_PAGE_SIZE) : 0;
+}
+
+function setSelectedEventForPageKey(pageKey, eventId) {
+  const selectionSetters = {
+    alerts: () => {
+      state.selectedAlertId = eventId;
+    },
+    fallEvents: () => {
+      state.selectedFallEventId = eventId;
+    },
+    reviewAlerts: () => {
+      state.selectedReviewAlertId = eventId;
+    },
+    showcase: () => {
+      state.selectedShowcaseId = eventId;
+    },
+  };
+  const setSelection = selectionSetters[pageKey];
+  if (typeof setSelection === "function") {
+    setSelection();
+  }
 }
 
 function renderShowMore(limitKey, totalCount, rerenderName) {
@@ -842,6 +983,10 @@ function resetVisibleLimit(limitKey) {
   state.visibleLimits[limitKey] = EVENT_PAGE_SIZE;
 }
 
+function resetEventPage(pageKey) {
+  state.eventPages[pageKey] = 0;
+}
+
 function rerenderNameForLimit(limitKey) {
   const rerenders = {
     alerts: "renderAlertsCenter",
@@ -860,7 +1005,9 @@ window.renderShowcaseEvaluation = renderShowcaseEvaluation;
 window.showMore = showMore;
 window.setAlertFilter = setAlertFilter;
 window.setShowcaseFilter = setShowcaseFilter;
+window.setEventPage = setEventPage;
 window.selectAlert = selectAlert;
+window.openAlertFromQueue = openAlertFromQueue;
 window.selectFallEvent = selectFallEvent;
 window.selectReviewAlert = selectReviewAlert;
 window.selectShowcase = selectShowcase;

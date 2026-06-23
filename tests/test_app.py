@@ -1,8 +1,13 @@
 import tempfile
+import http.client
+import threading
 import unittest
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+import app
 from app import create_api_response, guess_content_type, route_static_path
+from services.frontend_data import media_token_for_path
 
 
 class AppHelpersTest(unittest.TestCase):
@@ -42,6 +47,45 @@ class AppHelpersTest(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 route_static_path("/static/../secret.txt", static_dir)
+
+    def test_media_endpoint_supports_byte_range_requests(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_dir = Path(temp_dir) / "events"
+            event_dir.mkdir()
+            clip = event_dir / "event.mp4"
+            clip.write_bytes(b"0123456789")
+            token = media_token_for_path(clip)
+            original_event_dir = app.EVENT_DIR
+            app.EVENT_DIR = event_dir
+            server = ThreadingHTTPServer(("127.0.0.1", 0), app.FrontendRequestHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            connection = http.client.HTTPConnection(
+                "127.0.0.1",
+                server.server_port,
+                timeout=5,
+            )
+
+            try:
+                connection.request(
+                    "GET",
+                    f"/media/{token}",
+                    headers={"Range": "bytes=2-5"},
+                )
+                response = connection.getresponse()
+                body = response.read()
+
+                self.assertEqual(response.status, 206)
+                self.assertEqual(response.getheader("Accept-Ranges"), "bytes")
+                self.assertEqual(response.getheader("Content-Range"), "bytes 2-5/10")
+                self.assertEqual(response.getheader("Content-Length"), "4")
+                self.assertEqual(body, b"2345")
+            finally:
+                connection.close()
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=1)
+                app.EVENT_DIR = original_event_dir
 
 
 if __name__ == "__main__":

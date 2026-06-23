@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -203,7 +204,45 @@ class ClipBuilder:
 
         if written_frames == 0:
             raise ClipBuilderError("No frames were written to the event clip")
+        if clip_path.suffix.lower() == ".mp4" and clip_path.exists():
+            self._transcode_browser_mp4(clip_path)
         return written_frames
+
+    def _transcode_browser_mp4(self, clip_path: Path) -> None:
+        tmp_path = Path(str(clip_path) + ".tmp.mp4")
+        if tmp_path.exists():
+            tmp_path.unlink()
+        command = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(clip_path),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            "-an",
+            str(tmp_path),
+        ]
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            tmp_path.replace(clip_path)
+        except FileNotFoundError:
+            logger.warning("ffmpeg is not available; saved clip may not play in browsers")
+        except (OSError, subprocess.CalledProcessError) as exc:
+            logger.warning("Failed to transcode clip for browser playback: %s", exc)
+            if tmp_path.exists():
+                tmp_path.unlink()
 
     def _write_metadata(self, metadata_path: Path, metadata: Dict[str, Any]) -> None:
         try:

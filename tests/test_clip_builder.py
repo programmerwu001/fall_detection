@@ -129,6 +129,24 @@ class ClipBuilderTest(unittest.TestCase):
         self.assertEqual(metadata["category"], "confirmed_fall")
         self.assertEqual(metadata["candidate"]["candidate_id"], "candidate-with-extra-info")
 
+    def test_transcode_browser_mp4_replaces_clip_with_h264_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            builder = ClipBuilder(output_dir=temp_dir)
+            clip_path = Path(temp_dir) / "event_1.mp4"
+            clip_path.write_bytes(b"fmp4")
+
+            def fake_run(command, check, stdout, stderr):
+                self.assertTrue(check)
+                self.assertIn("libx264", command)
+                self.assertIn("yuv420p", command)
+                Path(command[-1]).write_bytes(b"h264")
+
+            with patch("services.clip_builder.subprocess.run", side_effect=fake_run):
+                builder._transcode_browser_mp4(clip_path)
+
+            self.assertEqual(clip_path.read_bytes(), b"h264")
+            self.assertFalse(Path(str(clip_path) + ".tmp.mp4").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

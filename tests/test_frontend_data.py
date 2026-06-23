@@ -55,6 +55,7 @@ class FrontendDataTest(unittest.TestCase):
         self.assertEqual(confirmed["vlm_result"], "confirmed_fall")
         self.assertEqual(confirmed["vlm_confidence"], 0.91)
         self.assertTrue(confirmed["media_url"].startswith("/media/"))
+        self.assertIn("?v=", confirmed["media_url"])
 
     def test_sqlite_status_overrides_json_category(self):
         db_path = self.root / "records.db"

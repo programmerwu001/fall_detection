@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from evaluate_caucafall import build_caucafall_report, render_markdown, write_outputs
+from services.event_repository import EventRepository
 
 
 class EvaluateCaucafallTest(unittest.TestCase):
@@ -78,6 +79,57 @@ class EvaluateCaucafallTest(unittest.TestCase):
         details = {row["source_uri"]: row for row in report["details"]}
         self.assertEqual(details["WalkS1.avi"]["outcome"], "FP")
         self.assertEqual(details["WalkS1.avi"]["vlm_reason"], "姿态不清晰，需要人工确认。")
+
+    def test_build_caucafall_report_uses_sqlite_vlm_results_after_review(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            event_dir = root / "events"
+            labels_path = root / "video_labels.csv"
+            db_path = root / "records.db"
+            _write_event(
+                event_dir / "cam1" / "20260616" / "event1.json",
+                source_uri="FallForwardS1.avi",
+                category="candidates",
+                yolo_score=0.7,
+                verification=None,
+            )
+            _write_video_labels(labels_path, [("FallForwardS1.avi", 1)])
+            repository = EventRepository(db_path).initialize()
+            repository.create_candidate_event(
+                event_id="event1",
+                camera_id="cam1",
+                source_uri="FallForwardS1.avi",
+                clip_path="event1.mp4",
+                metadata_path=str(event_dir / "cam1" / "20260616" / "event1.json"),
+                candidate={
+                    "candidate_id": "candidate_event1",
+                    "source_uri": "FallForwardS1.avi",
+                    "timestamp_ms": 1000,
+                    "score": 0.7,
+                },
+                yolo_score=0.7,
+            )
+            repository.enqueue_vlm_job("event1")
+            repository.complete_vlm_job(
+                "vlm_event1",
+                verification={
+                    "result": "confirmed_fall",
+                    "confidence": 0.95,
+                    "reason": "VLM confirmed the fall.",
+                },
+                final_status="confirmed_fall",
+            )
+
+            report = build_caucafall_report(event_dir, labels_path, db_path)
+
+        self.assertEqual(report["vlm"]["confirmed_fall"], 1)
+        self.assertEqual(report["vlm"]["pending_candidates"], 0)
+        self.assertEqual(report["vlm"]["average_confidence"], 0.95)
+        detail = report["details"][0]
+        self.assertEqual(detail["final_status"], "confirmed_fall")
+        self.assertEqual(detail["prediction"], "fall")
+        self.assertEqual(detail["outcome"], "TP")
+        self.assertEqual(detail["vlm_reason"], "VLM confirmed the fall.")
 
     def test_render_markdown_uses_chinese_labels_and_reasons(self):
         report = {

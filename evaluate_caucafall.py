@@ -10,15 +10,16 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from config import EVENT_DIR
+from config import DB_PATH, EVENT_DIR
 from services.metrics_report import load_event_metadata
 
 
-DEFAULT_LABELS_PATH = Path("data") / "labels" / "caucafall_video_labels.csv"
+DEFAULT_LABELS_PATH = Path("data") / "labels" / "test_video_labels.csv"
 DEFAULT_OUTPUT_JSON = Path("data") / "events" / "caucafall_eval_summary.json"
 DEFAULT_OUTPUT_MD = Path("data") / "events" / "caucafall_eval_summary.md"
 DEFAULT_OUTPUT_CSV = Path("data") / "events" / "caucafall_eval_details.csv"
@@ -48,6 +49,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report = build_caucafall_report(
         event_dir=Path(args.event_dir),
         labels_path=Path(args.labels_path),
+        queue_db_path=None if args.no_queue_db else Path(args.queue_db_path),
     )
     paths = write_outputs(
         report=report,
@@ -76,6 +78,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="CSV with source_uri,has_fall columns.",
     )
     parser.add_argument(
+        "--queue-db-path",
+        default=str(DB_PATH),
+        help="SQLite database with VLM-reviewed event statuses.",
+    )
+    parser.add_argument(
+        "--no-queue-db",
+        action="store_true",
+        help="Use event JSON only and ignore SQLite VLM results.",
+    )
+    parser.add_argument(
         "--output-json",
         default=str(DEFAULT_OUTPUT_JSON),
         help="Output summary JSON path.",
@@ -93,11 +105,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_caucafall_report(event_dir: Path | str, labels_path: Path | str) -> Dict[str, Any]:
+def build_caucafall_report(
+    event_dir: Path | str,
+    labels_path: Path | str,
+    queue_db_path: Optional[Path | str] = None,
+) -> Dict[str, Any]:
     event_dir_path = Path(event_dir)
     labels_path_obj = Path(labels_path)
     labels = _load_video_labels(labels_path_obj)
-    metadata = load_event_metadata(event_dir_path)
+    metadata = _merge_sqlite_vlm_results(
+        load_event_metadata(event_dir_path),
+        queue_db_path,
+    )
     events_by_source = _select_best_events_by_source(metadata)
 
     details: List[Dict[str, Any]] = []
@@ -299,6 +318,97 @@ def _load_video_labels(path: Path) -> List[Dict[str, Any]]:
                 }
             )
     return labels
+
+
+def _merge_sqlite_vlm_results(
+    metadata: Sequence[Dict[str, Any]],
+    queue_db_path: Optional[Path | str],
+) -> List[Dict[str, Any]]:
+    if queue_db_path is None:
+        return [dict(event) for event in metadata]
+    db_path = Path(queue_db_path)
+    if not db_path.exists():
+        return [dict(event) for event in metadata]
+
+    try:
+        sqlite_events = _load_sqlite_events(db_path)
+    except sqlite3.Error:
+        return [dict(event) for event in metadata]
+
+    merged: List[Dict[str, Any]] = []
+    known_ids = set()
+    for event in metadata:
+        updated = dict(event)
+        event_id = str(event.get("event_id") or "")
+        known_ids.add(event_id)
+        sqlite_event = sqlite_events.get(event_id)
+        if sqlite_event is not None:
+            updated["status"] = sqlite_event.get("status") or updated.get("status")
+            updated["category"] = _category_from_sqlite_status(
+                sqlite_event.get("status"),
+                updated.get("category"),
+            )
+            updated["verification"] = sqlite_event.get("verification") or updated.get(
+                "verification"
+            )
+            updated["candidate"] = sqlite_event.get("candidate") or updated.get("candidate")
+            updated["source_uri"] = sqlite_event.get("source_uri") or updated.get("source_uri")
+        merged.append(updated)
+    for event_id, sqlite_event in sqlite_events.items():
+        if event_id in known_ids:
+            continue
+        merged.append(
+            {
+                "event_id": event_id,
+                "camera_id": sqlite_event.get("camera_id"),
+                "source_uri": sqlite_event.get("source_uri"),
+                "category": _category_from_sqlite_status(sqlite_event.get("status"), None),
+                "status": sqlite_event.get("status"),
+                "candidate": sqlite_event.get("candidate"),
+                "verification": sqlite_event.get("verification"),
+            }
+        )
+    return merged
+
+
+def _load_sqlite_events(db_path: Path) -> Dict[str, Dict[str, Any]]:
+    with sqlite3.connect(str(db_path)) as connection:
+        connection.row_factory = sqlite3.Row
+        table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'events'"
+        ).fetchone()
+        if table is None:
+            return {}
+        rows = connection.execute("SELECT * FROM events").fetchall()
+
+    events: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        event = dict(row)
+        event["candidate"] = _json_object(event.pop("candidate_json", None))
+        event["verification"] = _json_object(event.pop("verification_json", None))
+        events[str(event.get("event_id") or "")] = event
+    return events
+
+
+def _category_from_sqlite_status(status: Any, fallback: Any) -> str:
+    status_text = str(status or "").strip()
+    if status_text in POSITIVE_STATUSES or status_text in NEGATIVE_STATUSES:
+        return status_text
+    if status_text in PENDING_STATUSES or status_text.startswith("vlm_"):
+        return "candidates"
+    return str(fallback or "candidates")
+
+
+def _json_object(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    try:
+        loaded = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
 
 
 def _select_best_events_by_source(
