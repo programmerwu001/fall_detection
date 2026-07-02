@@ -18,7 +18,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from config import DB_PATH, DEFAULT_VLM_MODEL, EVENT_DIR, TEST_VIDEO_DIR
+from config import (
+    DB_PATH,
+    DEFAULT_HIGH_RISK_REPEAT_SECONDS,
+    DEFAULT_LOW_RISK_REPEAT_SECONDS,
+    DEFAULT_PRIVACY_PREVIEW_MODEL,
+    DEFAULT_SAVE_DEBUG_RAW_EVENT_COPY,
+    DEFAULT_VLM_MODEL,
+    EVENT_DIR,
+    PRIVATE_EVENT_DIR,
+    TEST_VIDEO_DIR,
+)
+from services import event_state
 from services.clip_builder import ClipBuilder
 from services.event_buffer import EventBuffer
 from services.event_repository import EventRepository
@@ -86,10 +97,10 @@ def main() -> int:
 
     stats = PipelineStats(videos_seen=len(video_files))
     if not video_files:
-        logger.warning("No video files found: video_dir=%s", args.video_dir)
+        logger.warning("No video files found for configured input directory")
         return 0
 
-    logger.info("Found %s video file(s) under %s", len(video_files), args.video_dir)
+    logger.info("Found %s video file(s) for processing", len(video_files))
 
     yolo_detector = YoloCandidateDetector(
         model_path=args.yolo_model,
@@ -103,11 +114,16 @@ def main() -> int:
     async_vlm_enabled = is_async_vlm_enabled(args)
     event_repository: Optional[EventRepository] = None
     if async_vlm_enabled:
-        event_repository = EventRepository(args.queue_db_path).initialize()
-        logger.info(
-            "Async VLM enabled: candidate events will be queued in %s",
+        event_repository = EventRepository(
             args.queue_db_path,
-        )
+            high_risk_repeat_seconds=int(
+                getattr(args, "high_risk_repeat_seconds", DEFAULT_HIGH_RISK_REPEAT_SECONDS)
+            ),
+            low_risk_repeat_seconds=int(
+                getattr(args, "low_risk_repeat_seconds", DEFAULT_LOW_RISK_REPEAT_SECONDS)
+            ),
+        ).initialize()
+        logger.info("Async VLM enabled: candidate events will use SQLite queue")
 
     vlm_verifier = None
     if not args.skip_vlm and not async_vlm_enabled:
@@ -124,7 +140,13 @@ def main() -> int:
         args.pre_event_seconds + args.post_event_seconds + 2.0,
     )
     event_buffer = EventBuffer(max_seconds=buffer_seconds)
-    clip_builder = ClipBuilder(output_dir=args.output_dir)
+    clip_builder = ClipBuilder(
+        output_dir=args.output_dir,
+        internal_output_dir=PRIVATE_EVENT_DIR,
+        save_debug_raw_event_copy=bool(
+            getattr(args, "save_debug_raw_event_copy", DEFAULT_SAVE_DEBUG_RAW_EVENT_COPY)
+        ),
+    )
 
     camera_id = f"{args.camera_prefix}_001"
     try:
@@ -141,11 +163,10 @@ def main() -> int:
         )
     except Exception as exc:
         stats.errors += 1
-        logger.exception(
-            "Failed to process video sequence: camera_id=%s video_dir=%s error=%s",
+        logger.error(
+            "Failed to process video sequence: camera_id=%s error_type=%s",
             camera_id,
-            args.video_dir,
-            exc,
+            exc.__class__.__name__,
         )
     finally:
         event_buffer.clear(camera_id)
@@ -203,7 +224,12 @@ def process_video_sequence(
             last_global_timestamp_ms = None
             last_frame_interval_ms = None
 
-        logger.info("Processing sequence segment: camera_id=%s source_uri=%s", camera_id, video_path)
+        logger.info(
+            "Processing sequence segment: camera_id=%s index=%s of %s",
+            camera_id,
+            video_index + 1,
+            len(video_paths),
+        )
 
         source = FileVideoSource(
             camera_id=camera_id,
@@ -316,7 +342,7 @@ def process_video_file(
     stats: PipelineStats,
     event_repository: Optional[EventRepository] = None,
 ) -> None:
-    logger.info("Processing video: camera_id=%s source_uri=%s", camera_id, video_path)
+    logger.info("Processing video: camera_id=%s", camera_id)
 
     source = FileVideoSource(
         camera_id=camera_id,
@@ -502,12 +528,25 @@ def finalize_event(
         return
 
     if is_async_vlm_enabled(args):
+        demo_verification = (
+            verify_event(
+                candidate=candidate,
+                frames=frames,
+                vlm_verifier=None,
+                skip_vlm=True,
+            )
+            if getattr(args, "skip_vlm", False)
+            else None
+        )
         save_candidate_event(
             candidate=candidate,
             frames=frames,
             clip_builder=clip_builder,
             event_repository=event_repository,
             stats=stats,
+            queue_vlm=not bool(getattr(args, "skip_vlm", False)),
+            verification=demo_verification,
+            final_status=event_state.NEED_HUMAN_REVIEW if demo_verification else None,
         )
         return
 
@@ -531,7 +570,7 @@ def finalize_event(
         result=result,
         confidence=confidence,
         min_confidence=args.vlm_confidence_threshold,
-        save_review=args.save_review,
+        save_review=args.save_review or bool(getattr(args, "skip_vlm", False)),
         save_rejected=args.save_rejected,
     )
 
@@ -555,17 +594,17 @@ def finalize_event(
         )
         stats.clips_saved += 1
         logger.info(
-            "Saved verified event: event_id=%s clip_path=%s metadata_path=%s",
+            "Saved verified event: event_id=%s camera_id=%s category=%s",
             saved.get("event_id"),
-            saved.get("clip_path"),
-            saved.get("metadata_path"),
+            saved.get("camera_id"),
+            result,
         )
     except Exception as exc:
         stats.errors += 1
-        logger.exception(
-            "Failed to save event clip: candidate_id=%s error=%s",
+        logger.error(
+            "Failed to save event clip: candidate_id=%s error_type=%s",
             candidate.get("candidate_id"),
-            exc,
+            exc.__class__.__name__,
         )
 
 
@@ -575,6 +614,9 @@ def save_candidate_event(
     clip_builder: ClipBuilder,
     event_repository: Optional[EventRepository],
     stats: PipelineStats,
+    queue_vlm: bool = True,
+    verification: Optional[Dict[str, Any]] = None,
+    final_status: Optional[str] = None,
 ) -> None:
     try:
         if event_repository is None:
@@ -584,7 +626,7 @@ def save_candidate_event(
             candidate=candidate,
             verification=None,
             frame_packets=frames,
-            category="candidates",
+            category="candidates" if queue_vlm else event_state.NEED_HUMAN_REVIEW,
         )
         event_id = str(saved.get("event_id") or "")
         camera_id = str(
@@ -609,23 +651,39 @@ def save_candidate_event(
             candidate=candidate,
             yolo_score=_candidate_score(candidate),
         )
-        event_repository.enqueue_vlm_job(event_id=event_id)
 
         stats.clips_saved += 1
         stats.candidate_events_saved += 1
-        stats.vlm_jobs_queued += 1
-        logger.info(
-            "Queued candidate event for async VLM: event_id=%s camera_id=%s clip_path=%s",
-            event_id,
-            camera_id,
-            saved.get("clip_path"),
-        )
+        if queue_vlm:
+            event_repository.enqueue_vlm_job(event_id=event_id)
+            stats.vlm_jobs_queued += 1
+            logger.info(
+                "Queued candidate event for async VLM: event_id=%s camera_id=%s",
+                event_id,
+                camera_id,
+            )
+        else:
+            if verification is None or not final_status:
+                raise RuntimeError("verification and final_status are required without VLM queue")
+            _record_event_decision_without_job(
+                event_repository=event_repository,
+                event_id=event_id,
+                verification=verification,
+                final_status=final_status,
+            )
+            _increment_vlm_stats(stats, final_status)
+            logger.info(
+                "Recorded skip-vlm demo alert: event_id=%s camera_id=%s final_status=%s",
+                event_id,
+                camera_id,
+                final_status,
+            )
     except Exception as exc:
         stats.errors += 1
-        logger.exception(
-            "Failed to save candidate event: candidate_id=%s error=%s",
+        logger.error(
+            "Failed to save candidate event: candidate_id=%s error_type=%s",
             candidate.get("candidate_id"),
-            exc,
+            exc.__class__.__name__,
         )
 
 
@@ -639,15 +697,15 @@ def verify_event(
         return {
             "camera_id": candidate.get("camera_id"),
             "candidate_id": candidate.get("candidate_id"),
-            "result": "confirmed_fall",
-            "confidence": 1.0,
-            "reason": "VLM skipped by --skip-vlm; YOLO candidate accepted for debugging.",
+            "result": event_state.NEED_HUMAN_REVIEW,
+            "confidence": 0.0,
+            "reason": "VLM skipped by --skip-vlm; event recorded as low-risk demo alert.",
             "visible_evidence": ["YOLO candidate was emitted."],
             "raw_response": "",
-            "model_id": "skip_vlm",
+            "model_id": "skip_vlm_demo",
             "timestamp_ms": candidate.get("timestamp_ms", 0),
-            "metadata": {"backend": "skip_vlm"},
-            "is_confirmed": True,
+            "metadata": {"backend": "skip_vlm_demo"},
+            "is_confirmed": False,
         }
 
     if vlm_verifier is None:
@@ -659,17 +717,17 @@ def verify_event(
             frames=[packet["frame"] for packet in frames if packet.get("frame") is not None],
         )
     except Exception as exc:
-        logger.exception(
-            "VLM verification failed: candidate_id=%s error=%s",
+        logger.error(
+            "VLM verification failed: candidate_id=%s error_type=%s",
             candidate.get("candidate_id"),
-            exc,
+            exc.__class__.__name__,
         )
         return {
             "camera_id": candidate.get("camera_id"),
             "candidate_id": candidate.get("candidate_id"),
             "result": "need_human_review",
             "confidence": 0.0,
-            "reason": f"VLM verification failed: {exc}",
+            "reason": f"VLM verification failed: {exc.__class__.__name__}",
             "visible_evidence": [],
             "raw_response": "",
             "model_id": getattr(vlm_verifier, "model_id", "unknown"),
@@ -696,9 +754,41 @@ def should_save_event(
 
 
 def is_async_vlm_enabled(args: argparse.Namespace) -> bool:
-    return bool(getattr(args, "async_vlm", False)) and not bool(
-        getattr(args, "skip_vlm", False)
-    )
+    return bool(getattr(args, "async_vlm", False))
+
+
+def _record_event_decision_without_job(
+    event_repository: EventRepository,
+    event_id: str,
+    verification: Dict[str, Any],
+    final_status: str,
+) -> None:
+    record_event_decision = getattr(event_repository, "record_event_decision", None)
+    if callable(record_event_decision):
+        record_event_decision(
+            event_id=event_id,
+            verification=verification,
+            final_status=final_status,
+        )
+        return
+    complete_vlm_job = getattr(event_repository, "complete_vlm_job", None)
+    if callable(complete_vlm_job):
+        complete_vlm_job(
+            job_id=f"vlm_{event_id}",
+            verification=verification,
+            final_status=final_status,
+        )
+        return
+    raise RuntimeError("event_repository cannot record event decisions")
+
+
+def _increment_vlm_stats(stats: PipelineStats, final_status: str) -> None:
+    if final_status == event_state.CONFIRMED_FALL:
+        stats.vlm_confirmed += 1
+    elif final_status == event_state.REJECTED:
+        stats.vlm_rejected += 1
+    else:
+        stats.vlm_review += 1
 
 
 def _candidate_score(candidate: Dict[str, Any]) -> Optional[float]:
@@ -765,6 +855,10 @@ def _default_arg_values() -> Dict[str, Any]:
         "skip_vlm": False,
         "async_vlm": True,
         "queue_db_path": str(DB_PATH),
+        "save_debug_raw_event_copy": DEFAULT_SAVE_DEBUG_RAW_EVENT_COPY,
+        "privacy_preview_model": DEFAULT_PRIVACY_PREVIEW_MODEL,
+        "high_risk_repeat_seconds": DEFAULT_HIGH_RISK_REPEAT_SECONDS,
+        "low_risk_repeat_seconds": DEFAULT_LOW_RISK_REPEAT_SECONDS,
         "vlm_model": DEFAULT_VLM_MODEL,
         "vlm_backend": "transformers",
         "vlm_max_frames": 12,
@@ -849,6 +943,21 @@ def build_arg_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--skip-vlm", action=argparse.BooleanOptionalAction, default=defaults["skip_vlm"])
     parser.add_argument("--async-vlm", action=argparse.BooleanOptionalAction, default=defaults["async_vlm"])
     parser.add_argument("--queue-db-path", default=defaults["queue_db_path"])
+    parser.add_argument(
+        "--save-debug-raw-event-copy",
+        action=argparse.BooleanOptionalAction,
+        default=defaults["save_debug_raw_event_copy"],
+    )
+    parser.add_argument(
+        "--high-risk-repeat-seconds",
+        type=int,
+        default=defaults["high_risk_repeat_seconds"],
+    )
+    parser.add_argument(
+        "--low-risk-repeat-seconds",
+        type=int,
+        default=defaults["low_risk_repeat_seconds"],
+    )
     parser.add_argument("--vlm-model", default=defaults["vlm_model"])
     parser.add_argument(
         "--vlm-backend",

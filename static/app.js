@@ -24,13 +24,16 @@ const state = {
     reviewAlerts: 8,
     showcase: 8,
   },
+  reminderPollingStarted: false,
+  reminders: [],
 };
 
 const labels = {
-  confirmed_fall: "已确认摔倒",
-  need_human_review: "待复核",
-  candidates: "疑似摔倒",
-  rejected: "已过滤误报",
+  high_risk: "高风险摔倒告警",
+  low_risk: "低风险摔倒告警",
+  handled: "已处理",
+  no_alarm: "无护工告警",
+  pending_detection: "检测处理中",
   normal: "正常",
 };
 
@@ -45,8 +48,6 @@ const pages = [
 ];
 
 const EVENT_PAGE_SIZE = 4;
-
-const reviewStatuses = new Set(["candidates", "need_human_review"]);
 
 document.addEventListener("DOMContentLoaded", () => {
   renderStaticShell();
@@ -91,6 +92,7 @@ async function loadDynamicData() {
     renderFallEvents();
     renderReviewAlerts();
     renderShowcaseEvaluation();
+    startReminderPolling();
   } catch (error) {
     document.querySelectorAll(".dynamic-target").forEach((node) => {
       node.innerHTML = `<p class="error">数据加载失败：${escapeHtml(error.message)}</p>`;
@@ -98,8 +100,8 @@ async function loadDynamicData() {
   }
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url);
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, options);
   const payload = await response.json();
   if (!response.ok) {
     throw new Error(payload.error || `${url} 请求失败`);
@@ -125,13 +127,13 @@ function renderIntro() {
         <p class="eyebrow">摄像头风险监测原型</p>
         <h2>面向养老照护现场的摄像头摔倒风险监测平台</h2>
         <p>
-          把照护现场的摄像头画面组织成值班态势：先发现疑似摔倒，
-          再用 Video VLM 复核，并把回放、理由和留存状态放进同一份事件证据。
+          把照护现场的摄像头画面组织成值班态势：检测模块输出风险等级后立即告警，
+          护工在普通页面只看到告警状态和隐私预览占位。
         </p>
         <div class="hero-status-strip" aria-label="系统能力边界">
           <span>YOLO 高召回</span>
-          <span>VLM 慢路径复核</span>
-          <span>只读事件回放</span>
+          <span>VLM 风险分级</span>
+          <span>原始视频隔离</span>
         </div>
         <div class="hero-actions">
           <a class="button-link" href="#page=monitoring">进入实时监测</a>
@@ -150,7 +152,7 @@ function renderIntro() {
           </div>
           <div class="wall-tile is-review">
             <span>活动室 B</span>
-            <strong>待复核</strong>
+            <strong>低风险</strong>
           </div>
           <div class="wall-tile is-alert">
             <span>卧室 C</span>
@@ -163,9 +165,9 @@ function renderIntro() {
         </div>
         <div class="hero-rail">
           ${renderEvidenceRail({
-            display_status: "confirmed_fall",
+            display_status: "high_risk",
             yolo_score: 0.84,
-            vlm_result: "fall_detected",
+            vlm_label: "高风险摔倒告警",
           })}
         </div>
       </aside>
@@ -173,11 +175,11 @@ function renderIntro() {
     <div class="capability-grid">
       ${[
         ["摄像头风险监测", "以摄像头和区域为主语组织事件，而不是把结果呈现成视频文件列表。"],
-        ["疑似摔倒告警生成", "YOLO 高召回检测候选事件，并保留事件前后帧片段。"],
-        ["VLM 复核降低误报", "Video VLM 对候选片段给出判断、置信度和理由。"],
-        ["摔倒事件记录与回放", "确认事件进入事件档案，可查看来源视频、片段和元数据。"],
-        ["待复核告警管理", "不能明确判断的候选告警单独保留，后续接人工审核流程。"],
-        ["隐私保护与可信留存方向", "加密、哈希、防删除和授权查看是后续扩展方向，不作为第一版可操作能力。"],
+        ["摔倒告警生成", "YOLO 与 VLM 作为检测模块输出高风险或低风险告警。"],
+        ["告警优先处置", "高风险和低风险都立即进入护工处置队列，区别只在优先级和重复提醒频率。"],
+        ["剪影隐私预览", "普通告警页只播放受控剪影预览，生成中或失败时只显示状态，不回退播放原始事件片段。"],
+        ["处置闭环", "护工点击已处理后，事件变为已处理状态并停止重复提醒。"],
+        ["后续证据能力", "加密和证据调阅将在后续阶段接入，不属于当前实现范围。"],
       ]
         .map(
           ([title, body]) => `
@@ -202,9 +204,9 @@ function renderIntro() {
       <article class="panel">
         <h3>当前实现状态</h3>
         <ul class="list-plain">
-          <li>已实现摄像头风险告警、YOLO 候选检测、事件帧缓存和片段保存。</li>
-          <li>已实现异步 VLM 复核、SQLite 状态记录、元数据保存和指标报告。</li>
-          <li>多摄像头接入、持续监测画面、隐私加密、哈希校验、防删除证据留存和授权查看属于后续方向。</li>
+          <li>已实现摄像头风险告警、YOLO 候选检测、事件帧缓存和内部片段保存。</li>
+          <li>已实现异步 VLM 风险分级、SQLite 告警状态记录和重复提醒。</li>
+          <li>剪影预览、隐私加密、哈希校验、防删除证据留存和授权查看属于后续方向。</li>
         </ul>
       </article>
     </div>
@@ -231,7 +233,7 @@ function renderMonitoring() {
       <div>
         <p class="eyebrow">Monitoring workspace</p>
         <h2>实时监测</h2>
-        <p>按摄像头聚合当前事件数据，先看高风险区域，再进入回放证据。</p>
+        <p>按摄像头聚合当前事件数据，先看高风险区域，再进入告警处置。</p>
       </div>
       <div class="desk-clock">
         <span>值班视图</span>
@@ -241,11 +243,12 @@ function renderMonitoring() {
     <div class="status-strip">
       ${metricCard("摄像头数量", summary.camera_count)}
       ${metricCard("风险摄像头", summary.risk_camera_count)}
-      ${metricCard("已确认摔倒", summary.confirmed_fall)}
-      ${metricCard("待复核告警", summary.review_alerts)}
-      ${metricCard("疑似摔倒", summary.candidate_alerts)}
-      ${metricCard("已过滤误报", summary.rejected)}
+      ${metricCard("高风险告警", summary.high_risk)}
+      ${metricCard("低风险告警", summary.low_risk)}
+      ${metricCard("已处理", summary.handled)}
+      ${metricCard("无护工告警", summary.no_alarm)}
     </div>
+    ${renderReminderBanner()}
     <div class="workspace-layout">
       <div>
         ${renderCameraCards(dashboard.cameras || [])}
@@ -301,11 +304,11 @@ function renderCameraCards(cameras) {
                   <strong>${escapeHtml(camera.last_alert_type || "暂无")}</strong>
                 </div>
                 <div class="data-pair">
-                  <span>待复核数量</span>
+                  <span>低风险待处理</span>
                   <strong>${formatNumber(camera.pending_review_count)}</strong>
                 </div>
                 <div class="data-pair">
-                  <span>确认事件数量</span>
+                  <span>高风险告警</span>
                   <strong>${formatNumber(camera.confirmed_event_count)}</strong>
                 </div>
               </div>
@@ -350,8 +353,8 @@ function renderQueueSummary(queue, summary) {
     <div class="panel" style="margin-top: 14px;">
       <h3>待处理摘要</h3>
       <div class="detail-grid">
-        <div class="detail-item"><span>待 VLM 复核</span><strong>${formatNumber(pending)}</strong></div>
-        <div class="detail-item"><span>需人工复核</span><strong>${formatNumber(summary.review_alerts)}</strong></div>
+        <div class="detail-item"><span>待 VLM 分级</span><strong>${formatNumber(pending)}</strong></div>
+        <div class="detail-item"><span>低风险待处理</span><strong>${formatNumber(summary.low_risk)}</strong></div>
         <div class="detail-item"><span>队列状态</span><strong>${queue.available ? "可读取" : "未读取"}</strong></div>
         <div class="detail-item"><span>高风险摄像头</span><strong>${summary.risk_camera_count ? "存在" : "暂无"}</strong></div>
       </div>
@@ -364,7 +367,7 @@ function renderAlertsCenterLoading() {
     <div class="section-header">
       <p class="eyebrow">Alert center</p>
       <h2>告警中心</h2>
-      <p>正在加载 confirmed、candidates 和 need_human_review 类型告警。</p>
+      <p>正在加载高风险和低风险护工告警。</p>
     </div>
     <div class="dynamic-target"><p class="loading">加载中...</p></div>
   `;
@@ -373,16 +376,16 @@ function renderAlertsCenterLoading() {
 function renderAlertsCenter() {
   const filters = [
     ["all", "全部告警"],
-    ["confirmed_fall", "已确认摔倒"],
-    ["need_human_review", "待复核"],
-    ["candidates", "疑似摔倒"],
+    ["high_risk", "高风险"],
+    ["low_risk", "低风险"],
+    ["handled", "已处理"],
   ];
   const events = filteredAlerts();
   document.querySelector("#alerts").innerHTML = `
     <div class="section-header">
       <p class="eyebrow">Alert center</p>
       <h2>告警中心</h2>
-      <p>展示系统发现的风险告警，默认不展示已过滤误报。</p>
+      <p>展示检测模块输出的高风险和低风险护工告警。</p>
     </div>
     <div class="filter-bar">
       ${filters
@@ -405,8 +408,8 @@ function renderFallEventsLoading() {
   document.querySelector("#fall-events").innerHTML = `
     <div class="section-header">
       <p class="eyebrow">Confirmed events</p>
-      <h2>摔倒事件记录</h2>
-      <p>正在加载已确认摔倒事件。</p>
+      <h2>高风险摔倒告警</h2>
+      <p>正在加载高风险摔倒告警。</p>
     </div>
     <div class="dynamic-target"><p class="loading">加载中...</p></div>
   `;
@@ -416,14 +419,14 @@ function renderFallEvents() {
   document.querySelector("#fall-events").innerHTML = `
     <div class="section-header">
       <p class="eyebrow">Confirmed events</p>
-      <h2>摔倒事件记录</h2>
-      <p>只展示已确认摔倒事件，形成可回放的事件档案。</p>
+      <h2>高风险摔倒告警</h2>
+      <p>只展示高优先级护工告警，红色提醒默认每 20 秒重复触发。</p>
     </div>
     <div class="event-layout">
       <div>${renderEventTable(state.fallEvents, state.selectedFallEventId, "selectFallEvent", "fallEvents")}</div>
       <div class="detail-panel sticky-detail" id="fall-event-detail"></div>
     </div>
-    <div class="note">该模块后续适合加入访问控制。第一版只展示状态，不实现登录、授权或解密。</div>
+    <div class="note">普通告警页不展示原始视频。隐私预览生成中会显示状态，生成后只播放剪影预览，失败时提示到场核验。</div>
   `;
   renderEventDetail("#fall-event-detail", state.selectedFallEventId);
 }
@@ -432,8 +435,8 @@ function renderReviewAlertsLoading() {
   document.querySelector("#review-alerts").innerHTML = `
     <div class="section-header">
       <p class="eyebrow">Review queue</p>
-      <h2>待复核告警</h2>
-      <p>正在加载候选告警和需人工复核告警。</p>
+      <h2>低风险摔倒告警</h2>
+      <p>正在加载低风险摔倒告警。</p>
     </div>
     <div class="dynamic-target"><p class="loading">加载中...</p></div>
   `;
@@ -443,14 +446,14 @@ function renderReviewAlerts() {
   document.querySelector("#review-alerts").innerHTML = `
     <div class="section-header">
       <p class="eyebrow">Review queue</p>
-      <h2>待复核告警</h2>
-      <p>展示还不能直接归档为摔倒事件、需要 VLM 或人工判断的告警。</p>
+      <h2>低风险摔倒告警</h2>
+      <p>展示低优先级护工告警，黄色提醒默认每 60 秒重复触发。</p>
     </div>
     <div class="event-layout">
       <div>${renderEventTable(state.reviewAlerts, state.selectedReviewAlertId, "selectReviewAlert", "reviewAlerts")}</div>
       <div class="detail-panel sticky-detail" id="review-alert-detail"></div>
     </div>
-    <div class="note">第一版不提供通过、拒绝或提交审核结果按钮，只为后续人工审核流程预留位置。</div>
+    <div class="note">低风险告警同样需要立即到场核验；“已处理”只表示护工已接警处置。</div>
   `;
   renderEventDetail("#review-alert-detail", state.selectedReviewAlertId);
 }
@@ -469,16 +472,16 @@ function renderShowcaseEvaluationLoading() {
 function renderShowcaseEvaluation() {
   const filters = [
     ["all", "全部可展示案例"],
-    ["confirmed_fall", "确认摔倒"],
-    ["review", "待 VLM/人工复核"],
-    ["need_human_review", "需人工复核"],
+    ["high_risk", "高风险"],
+    ["low_risk", "低风险"],
+    ["handled", "已处理"],
   ];
   const cases = filteredShowcaseCases();
   document.querySelector("#showcase-evaluation").innerHTML = `
     <div class="section-header">
       <p class="eyebrow">Showcase and evaluation</p>
-      <h2>案例回放与评估</h2>
-      <p>可点击案例不包含已过滤误报；误报数量只进入指标统计。</p>
+      <h2>告警案例与评估</h2>
+      <p>案例页只展示普通告警数据，不提供原始视频调阅。</p>
     </div>
     <div class="grid-2">
       <div>
@@ -531,6 +534,34 @@ function renderEventTable(events, selectedId, onSelectName, limitKey) {
   `;
 }
 
+function renderReminderBanner() {
+  if (!state.reminders.length) {
+    return "";
+  }
+  const latest = state.reminders.slice(0, 3);
+  return `
+    <div class="reminder-banner" aria-live="polite">
+      <div>
+        <span>重复提醒</span>
+        <strong>${latest.length} 条告警到期</strong>
+      </div>
+      <div class="reminder-list">
+        ${latest
+          .map(
+            (reminder) => `
+              <button type="button" class="reminder-chip ${escapeAttr(reminder.risk_level)}" onclick="openAlertFromQueue('${escapeAttr(reminder.event_id)}')">
+                ${escapeHtml(labels[reminder.risk_level] || reminder.risk_level)}
+                · ${escapeHtml(reminder.camera_id || "未知摄像头")}
+                · 第 ${formatNumber(reminder.reminder_count)} 次
+              </button>
+            `,
+          )
+          .join("")}
+      </div>
+    </div>
+  `;
+}
+
 async function renderEventDetail(containerSelector, eventId) {
   const container = document.querySelector(containerSelector);
   if (!container) return;
@@ -545,62 +576,72 @@ async function renderEventDetail(containerSelector, eventId) {
     const candidate = detail.candidate || {};
     const verification = detail.verification || {};
     const status = detail.status_explanations || {};
-    const displayStatus = event.display_status || event.status || "normal";
+    const displayStatus = event.display_status || event.risk_level || "normal";
     const currentDecision =
-      event.status_label || labels[displayStatus] || displayStatus;
-    const reviewConfidence =
+      event.vlm_label || event.status_label || labels[displayStatus] || labels[event.risk_level] || displayStatus;
+    const vlmConfidence =
       verification.confidence ?? event.vlm_confidence ?? "未记录";
     const evidenceStatus =
-      status.integrity_status || event.integrity_label || "未记录";
-    const media = event.media_url
-      ? `<video class="video-player" controls preload="metadata" src="${escapeAttr(event.media_url)}"></video>`
-      : `<div class="camera-placeholder empty-video">暂无可播放片段</div>`;
+      privacyPreviewStatusLabel(event.privacy_preview_status);
+    const handleButton =
+      event.can_handle === true && event.alert_status === "pending"
+        ? `<button class="button-link handle-button" type="button" onclick="handleEvent('${escapeAttr(event.event_id)}')">已处理</button>`
+        : "";
+    const media = renderPrivacyPreviewMedia(event, evidenceStatus);
     container.innerHTML = `
       <div class="detail-heading">
         <div>
-          <p class="eyebrow">事件证据</p>
+          <p class="eyebrow">告警事件</p>
           <h3>${escapeHtml(event.event_id || "事件详情")}</h3>
         </div>
-        ${badge(displayStatus)}
+        <div class="detail-actions">
+          ${badge(displayStatus)}
+          ${handleButton}
+        </div>
       </div>
       <div class="decision-summary" aria-label="事件判断摘要">
         <div class="decision-summary-item">
-          <span>当前结论</span>
+          <span>风险等级</span>
           <strong>${escapeHtml(currentDecision)}</strong>
         </div>
         <div class="decision-summary-item">
-          <span>复核置信度</span>
-          <strong>${formatNumber(reviewConfidence)}</strong>
+          <span>处置状态</span>
+          <strong>${escapeHtml(alertStatusLabel(event.alert_status))}</strong>
         </div>
         <div class="decision-summary-item">
-          <span>证据状态</span>
+          <span>隐私预览</span>
           <strong>${escapeHtml(evidenceStatus)}</strong>
         </div>
       </div>
       <div class="detail-media">${media}</div>
       ${renderEvidenceRail({
         display_status: displayStatus,
+        alert_status: event.alert_status,
         yolo_score: event.yolo_score || candidate.score,
-        vlm_result: verification.result || event.vlm_result,
+        vlm_label: event.vlm_label,
       })}
       <h4 class="detail-subhead">关键判断</h4>
       <div class="detail-grid evidence-grid">
         ${detailItem("摄像头 ID", event.camera_id)}
         ${detailItem("告警时间", event.created_at)}
-        ${detailItem("当前状态", event.status_label)}
-        ${detailItem("YOLO candidate 摘要", event.candidate_summary || candidate.score)}
-        ${detailItem("VLM 结果", verification.result || event.vlm_result || "未复核")}
-        ${detailItem("VLM 置信度", verification.confidence ?? event.vlm_confidence)}
+        ${detailItem("风险等级", event.risk_label || event.status_label)}
+        ${detailItem("处置状态", alertStatusLabel(event.alert_status))}
+        ${detailItem("处理账号", event.handled_by)}
+        ${detailItem("处理时间", event.handled_at)}
+        ${detailItem("YOLO 摘要", event.candidate_summary || candidate.score)}
+        ${detailItem("VLM 状态", event.vlm_label || "未分级")}
+        ${detailItem("VLM 置信度", vlmConfidence)}
         ${detailItem("VLM 判断理由", verification.reason || verification.failure_reason || "未记录")}
         ${detailItem("可见证据", Array.isArray(verification.visible_evidence) ? verification.visible_evidence.join("；") : "")}
       </div>
       <h4 class="detail-subhead">安全留存</h4>
       <div class="detail-grid evidence-grid">
-        ${detailItem("来源模拟视频", event.source_uri)}
-        ${detailItem("Clip 路径", event.clip_path)}
-        ${detailItem("隐私状态", status.privacy_status || event.privacy_label)}
-        ${detailItem("完整性状态", status.integrity_status || event.integrity_label)}
-        ${detailItem("留存状态", status.retention_status || event.retention_label)}
+        ${detailItem("决策来源", event.decision_source)}
+        ${detailItem("系统降级", event.system_degraded ? "是" : "否")}
+        ${detailItem("上次提醒", event.last_notified_at)}
+        ${detailItem("下次提醒", event.next_remind_at)}
+        ${detailItem("提醒次数", event.reminder_count)}
+        ${detailItem("隐私预览状态", evidenceStatus)}
         ${detailItem("片段时长", event.duration_seconds ? `${event.duration_seconds} 秒` : "未记录")}
       </div>
     `;
@@ -609,10 +650,39 @@ async function renderEventDetail(containerSelector, eventId) {
   }
 }
 
+function renderPrivacyPreviewMedia(event, evidenceStatus) {
+  if (event.privacy_preview_status === "ready" && event.privacy_preview_url) {
+    return `
+      <video
+        class="video-player privacy-preview-player"
+        controls
+        preload="metadata"
+        src="${escapeAttr(event.privacy_preview_url)}"
+        aria-label="隐私剪影预览视频"
+      ></video>
+    `;
+  }
+  if (event.privacy_preview_status === "processing" || event.privacy_preview_status === "pending") {
+    return `<div class="camera-placeholder empty-video">隐私视频生成中</div>`;
+  }
+  if (event.privacy_preview_status === "failed") {
+    return `<div class="camera-placeholder empty-video">隐私视频暂不可用，请立即到场核验</div>`;
+  }
+  return `<div class="camera-placeholder empty-video">${escapeHtml(evidenceStatus || "隐私视频尚未生成")}</div>`;
+}
+
 function renderEvidenceRail(event) {
   const status = event.display_status || event.status || "normal";
-  const vlmResult = event.vlm_result || event.verification_result || "未复核";
-  const archived = status === "confirmed_fall" ? "已归档" : status === "rejected" ? "已过滤" : "待处置";
+  const vlmResult = event.vlm_label || "未分级";
+  const alertStatus = event.alert_status || "";
+  const archived =
+    alertStatus === "handled" || status === "handled"
+      ? "已处理"
+      : status === "no_alarm"
+        ? "无告警"
+        : status === "pending_detection"
+          ? "检测中"
+          : "待处置";
   return `
     <div class="event-rail" aria-label="事件证据导轨">
       <div class="rail-step">
@@ -628,7 +698,7 @@ function renderEvidenceRail(event) {
         <strong>${escapeHtml(vlmResult)}</strong>
       </div>
       <div class="rail-step ${escapeAttr(status)}">
-        <span>归档</span>
+        <span>处置</span>
         <strong>${archived}</strong>
       </div>
     </div>
@@ -652,16 +722,16 @@ function renderEvaluationCards(summary) {
   return `
     <div class="grid-2">
       ${metricCard("可展示案例", summary.displayed_cases)}
-      ${metricCard("确认摔倒", summary.confirmed_fall)}
-      ${metricCard("待复核告警", summary.review_alerts)}
-      ${metricCard("疑似摔倒告警", summary.candidate_alerts)}
-      ${metricCard("已过滤误报", summary.rejected)}
+      ${metricCard("高风险告警", summary.high_risk)}
+      ${metricCard("低风险告警", summary.low_risk)}
+      ${metricCard("检测中事件", summary.pending_detection)}
+      ${metricCard("无护工告警", summary.no_alarm)}
       ${metricCard("YOLO 平均分", yolo.average_score)}
       ${metricCard("VLM 平均置信度", vlm.average_confidence)}
-      ${metricCard("VLM 已复核", vlm.verified_events)}
-      ${metricCard("VLM 确认", vlm.confirmed_fall)}
-      ${metricCard("VLM 拒绝", vlm.rejected)}
-      ${metricCard("VLM 人工复核", vlm.need_human_review)}
+      ${metricCard("VLM 已分级", vlm.verified_events)}
+      ${metricCard("VLM 高风险", vlm.high_risk)}
+      ${metricCard("VLM 无告警", vlm.no_alarm)}
+      ${metricCard("VLM 低风险", vlm.low_risk)}
     </div>
     <div class="grid-2" style="margin-top: 12px;">${labelBlock}</div>
   `;
@@ -677,11 +747,11 @@ function renderArchitecture() {
     <div class="pipeline">
       ${[
         ["摄像头视频流", "当前由本地视频目录模拟输入。"],
-        ["YOLO 实时候选检测", "pose/person 模型生成疑似摔倒候选。"],
+        ["YOLO 实时候选检测", "pose/person 模型生成内部候选事件片段。"],
         ["事件前后帧缓存", "EventBuffer 保存触发点前后帧。"],
-        ["疑似摔倒告警生成", "ClipBuilder 写入事件片段和 JSON 元数据。"],
-        ["Video VLM 复核", "SQLite 队列支持异步 worker 复核。"],
-        ["事件记录 / 误报过滤", "SQLite 状态优先作为前端分类依据。"],
+        ["候选事件片段生成", "ClipBuilder 写入内部事件片段和 JSON 元数据。"],
+        ["Video VLM 风险分级", "SQLite 队列支持异步 worker 写入高低风险。"],
+        ["告警状态机", "SQLite 告警状态优先作为前端分类依据。"],
       ]
         .map(
           ([title, body]) => `
@@ -698,16 +768,16 @@ function renderArchitecture() {
         <h3>已实现链路</h3>
         <ul class="list-plain">
           <li>本地视频模拟摄像头输入。</li>
-          <li>YOLO pose/person 模型生成疑似摔倒候选。</li>
+          <li>YOLO pose/person 模型生成内部候选事件片段。</li>
           <li>事件前后帧缓存、片段写入和 JSON 元数据保存。</li>
-          <li>SQLite 队列、异步 VLM worker、事件状态合并和指标报告。</li>
+          <li>SQLite 队列、异步 VLM worker、风险等级合并和指标报告。</li>
         </ul>
       </article>
       <article class="panel">
         <h3>后续安全扩展方向</h3>
         <ul class="list-plain">
           <li>RTSP / 真实摄像头接入和持续实时视频画面。</li>
-          <li>事件视频加密、人体区域隐私保护和授权查看。</li>
+          <li>剪影预览、事件视频加密、人体区域隐私保护和授权查看。</li>
           <li>视频哈希校验、多节点备份、删除/篡改检测。</li>
         </ul>
       </article>
@@ -789,6 +859,20 @@ function setAlertFilter(value) {
   renderAlertsCenter();
 }
 
+function alertStatusLabel(value) {
+  if (value === "pending") return "待处理";
+  if (value === "handled") return "已处理";
+  if (value === "none") return "无护工告警";
+  return value || "未记录";
+}
+
+function privacyPreviewStatusLabel(value) {
+  if (value === "processing") return "隐私视频生成中";
+  if (value === "ready") return "隐私视频已生成";
+  if (value === "failed") return "隐私视频暂不可用，请立即到场核验";
+  return "隐私视频尚未生成";
+}
+
 function setShowcaseFilter(value) {
   state.activeShowcaseFilter = value;
   resetEventPage("showcase");
@@ -829,6 +913,24 @@ function selectShowcase(eventId) {
   renderShowcaseEvaluation();
 }
 
+async function handleEvent(eventId) {
+  if (!eventId) return;
+  try {
+    await fetchJson(`/api/events/${encodeURIComponent(eventId)}/handle`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-User-Account": "demo_caregiver",
+      },
+      body: "{}",
+    });
+    state.reminders = state.reminders.filter((item) => item.event_id !== eventId);
+    await loadDynamicData();
+  } catch (error) {
+    window.alert(`标记已处理失败：${error.message}`);
+  }
+}
+
 function limitedEvents(events, limitKey) {
   const limit = state.visibleLimits[limitKey] || EVENT_PAGE_SIZE;
   return events.slice(0, limit);
@@ -836,9 +938,13 @@ function limitedEvents(events, limitKey) {
 
 function filteredAlerts() {
   return state.alerts.filter((event) => {
+    if (state.activeAlertFilter === "all") return true;
+    if (state.activeAlertFilter === "handled") {
+      return event.alert_status === "handled";
+    }
     return (
-      state.activeAlertFilter === "all" ||
-      event.display_status === state.activeAlertFilter
+      event.risk_level === state.activeAlertFilter &&
+      event.alert_status !== "handled"
     );
   });
 }
@@ -846,10 +952,10 @@ function filteredAlerts() {
 function filteredShowcaseCases() {
   return state.showcaseCases.filter((event) => {
     if (state.activeShowcaseFilter === "all") return true;
-    if (state.activeShowcaseFilter === "review") {
-      return reviewStatuses.has(event.display_status);
+    if (state.activeShowcaseFilter === "handled") {
+      return event.alert_status === "handled";
     }
-    return event.display_status === state.activeShowcaseFilter;
+    return event.risk_level === state.activeShowcaseFilter;
   });
 }
 
@@ -983,6 +1089,51 @@ function resetVisibleLimit(limitKey) {
   state.visibleLimits[limitKey] = EVENT_PAGE_SIZE;
 }
 
+function startReminderPolling() {
+  if (state.reminderPollingStarted) return;
+  state.reminderPollingStarted = true;
+  pollReminders();
+  window.setInterval(pollReminders, 2000);
+}
+
+async function pollReminders() {
+  try {
+    const payload = await fetchJson("/api/reminders");
+    const reminders = payload.reminders || [];
+    const activeReminders = reminders.filter((reminder) => reminder.alert_status === "pending");
+    if (!activeReminders.length) return;
+    state.reminders = [...activeReminders, ...state.reminders]
+      .filter((item, index, all) => {
+        return all.findIndex((other) => other.event_id === item.event_id) === index;
+      })
+      .slice(0, 6);
+    playReminderTone(activeReminders[0].risk_level);
+    renderMonitoring();
+    renderAlertsCenter();
+  } catch (error) {
+    console.warn("提醒轮询失败", error);
+  }
+}
+
+function playReminderTone(riskLevel) {
+  const AudioContext = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContext) return;
+  try {
+    const context = new AudioContext();
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    oscillator.frequency.value = riskLevel === "high_risk" ? 880 : 620;
+    gain.gain.value = 0.035;
+    oscillator.connect(gain);
+    gain.connect(context.destination);
+    oscillator.start();
+    oscillator.stop(context.currentTime + 0.16);
+    oscillator.onended = () => context.close();
+  } catch (error) {
+    console.warn("提醒声音不可用", error);
+  }
+}
+
 function resetEventPage(pageKey) {
   state.eventPages[pageKey] = 0;
 }
@@ -1011,3 +1162,4 @@ window.openAlertFromQueue = openAlertFromQueue;
 window.selectFallEvent = selectFallEvent;
 window.selectReviewAlert = selectReviewAlert;
 window.selectShowcase = selectShowcase;
+window.handleEvent = handleEvent;

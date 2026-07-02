@@ -29,7 +29,8 @@ class FakeClipBuilder:
             "event_id": "event1",
             "camera_id": kwargs["candidate"].get("camera_id", "cam1"),
             "source_uri": kwargs["frame_packets"][0].get("source_uri", ""),
-            "clip_path": "clip.mp4",
+            "clip_path": "private_clip.mp4",
+            "debug_clip_path": "debug_clip.mp4",
             "metadata_path": "clip.json",
         }
 
@@ -38,6 +39,7 @@ class FakeEventRepository:
     def __init__(self):
         self.created_events = []
         self.queued_jobs = []
+        self.completed_jobs = []
 
     def create_candidate_event(self, **kwargs):
         self.created_events.append(kwargs)
@@ -46,6 +48,10 @@ class FakeEventRepository:
     def enqueue_vlm_job(self, **kwargs):
         self.queued_jobs.append(kwargs)
         return {"job_id": f"vlm_{kwargs['event_id']}", **kwargs}
+
+    def complete_vlm_job(self, **kwargs):
+        self.completed_jobs.append(kwargs)
+        return {"job_id": kwargs["job_id"], "status": "done"}
 
 
 class FakeVlmVerifier:
@@ -176,11 +182,12 @@ class RunGatewayTest(unittest.TestCase):
         self.assertEqual([packet["frame_id"] for packet in active.frames], [1, 2])
         self.assertEqual(active.end_timestamp_ms, 3000)
 
-    def test_finalize_event_accepts_yolo_candidate_when_vlm_is_skipped(self):
+    def test_finalize_event_uses_low_risk_demo_mode_when_vlm_is_skipped(self):
         stats = run_gateway.PipelineStats()
         clip_builder = FakeClipBuilder()
         args = argparse.Namespace(
             skip_vlm=True,
+            async_vlm=False,
             vlm_confidence_threshold=0.6,
             save_review=False,
             save_rejected=False,
@@ -195,9 +202,50 @@ class RunGatewayTest(unittest.TestCase):
 
         run_gateway.finalize_event(active, None, clip_builder, args, stats)
 
-        self.assertEqual(stats.vlm_confirmed, 1)
+        self.assertEqual(stats.vlm_review, 1)
         self.assertEqual(stats.clips_saved, 1)
-        self.assertEqual(clip_builder.saved[0]["category"], "confirmed_fall")
+        self.assertEqual(clip_builder.saved[0]["category"], "need_human_review")
+
+    def test_skip_vlm_async_demo_creates_low_risk_database_alert_without_queue(self):
+        stats = run_gateway.PipelineStats()
+        clip_builder = FakeClipBuilder()
+        repository = FakeEventRepository()
+        args = argparse.Namespace(
+            skip_vlm=True,
+            async_vlm=True,
+            vlm_confidence_threshold=0.6,
+            save_review=False,
+            save_rejected=False,
+        )
+        active = run_gateway.ActiveEvent(
+            candidate={"camera_id": "cam1", "candidate_id": "c1", "timestamp_ms": 1000},
+            frames=[
+                {
+                    "camera_id": "cam1",
+                    "frame_id": 0,
+                    "timestamp_ms": 1000,
+                    "frame": object(),
+                    "source_uri": "video.mp4",
+                }
+            ],
+            end_timestamp_ms=1000,
+        )
+
+        run_gateway.finalize_event(
+            active,
+            None,
+            clip_builder,
+            args,
+            stats,
+            event_repository=repository,
+        )
+
+        self.assertEqual(stats.candidate_events_saved, 1)
+        self.assertEqual(stats.vlm_review, 1)
+        self.assertEqual(repository.queued_jobs, [])
+        self.assertEqual(repository.created_events[0]["clip_path"], "private_clip.mp4")
+        self.assertEqual(repository.completed_jobs[0]["verification"]["result"], "need_human_review")
+        self.assertEqual(repository.completed_jobs[0]["final_status"], "need_human_review")
 
     def test_finalize_event_in_async_mode_saves_candidate_and_queues_vlm_job(self):
         stats = run_gateway.PipelineStats()
@@ -249,6 +297,7 @@ class RunGatewayTest(unittest.TestCase):
         self.assertEqual(repository.created_events[0]["event_id"], "event1")
         self.assertEqual(repository.created_events[0]["camera_id"], "cam1")
         self.assertEqual(repository.created_events[0]["source_uri"], "video.mp4")
+        self.assertEqual(repository.created_events[0]["clip_path"], "private_clip.mp4")
         self.assertEqual(repository.created_events[0]["yolo_score"], 0.82)
         self.assertEqual(repository.queued_jobs[0]["event_id"], "event1")
 
@@ -581,6 +630,9 @@ class RunGatewayTest(unittest.TestCase):
                         "candidate_threshold": 0.4,
                         "skip_vlm": True,
                         "vlm_backend": "minicpm_chat",
+                        "save_debug_raw_event_copy": False,
+                        "high_risk_repeat_seconds": 22,
+                        "low_risk_repeat_seconds": 66,
                     },
                     ensure_ascii=False,
                 ),
@@ -609,6 +661,9 @@ class RunGatewayTest(unittest.TestCase):
         self.assertEqual(args.candidate_threshold, 0.7)
         self.assertFalse(args.skip_vlm)
         self.assertEqual(args.vlm_backend, "minicpm_chat")
+        self.assertFalse(args.save_debug_raw_event_copy)
+        self.assertEqual(args.high_risk_repeat_seconds, 22)
+        self.assertEqual(args.low_risk_repeat_seconds, 66)
 
 
 if __name__ == "__main__":

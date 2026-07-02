@@ -22,6 +22,9 @@ env/
 
 # Runtime data and generated artifacts
 data/
+data/events/
+data/private_events/
+data/debug_events_disabled/
 ledger/*.jsonl
 *.db
 *.sqlite

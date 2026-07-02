@@ -103,9 +103,11 @@ class StaticFrontendTest(unittest.TestCase):
         detail_end = js.index("function renderEvaluationCards")
         detail = js[detail_start:detail_end]
 
-        self.assertIn("事件证据", detail)
+        self.assertIn("告警事件", detail)
         self.assertIn("关键判断", detail)
         self.assertIn("安全留存", detail)
+        self.assertIn("event.vlm_label", detail)
+        self.assertNotIn("verification.result", detail)
 
     def test_latest_alerts_open_visible_alert_detail(self):
         js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
@@ -125,9 +127,44 @@ class StaticFrontendTest(unittest.TestCase):
         detail = js[detail_start:detail_end]
 
         self.assertIn("decision-summary", detail)
-        self.assertIn("当前结论", detail)
-        self.assertIn("复核置信度", detail)
-        self.assertIn("证据状态", detail)
+        self.assertIn("风险等级", detail)
+        self.assertIn("处置状态", detail)
+        self.assertIn("隐私预览", detail)
+
+    def test_detail_panel_only_renders_controlled_privacy_preview_video(self):
+        js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        detail_start = js.index("async function renderEventDetail")
+        detail_end = js.index("function renderEvaluationCards")
+        detail = js[detail_start:detail_end]
+
+        self.assertIn("隐私视频尚未生成", detail)
+        self.assertIn("隐私视频生成中", detail)
+        self.assertIn("隐私视频暂不可用，请立即到场核验", detail)
+        self.assertIn("event.privacy_preview_url", detail)
+        self.assertIn("<video", detail)
+        self.assertIn('src="${escapeAttr(event.privacy_preview_url)}"', detail)
+        self.assertNotIn("event.media_url", detail)
+        self.assertNotIn("event.clip_path", detail)
+
+    def test_frontend_does_not_display_internal_legacy_status_labels(self):
+        js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertNotIn("confirmed_fall", js)
+        self.assertNotIn("need_human_review", js)
+        self.assertNotIn("candidates", js)
+        self.assertNotIn("确认摔倒", js)
+        self.assertNotIn("人工复核", js)
+        self.assertNotIn("人工审核", js)
+
+    def test_reminder_polling_filters_non_pending_reminders_before_alerting(self):
+        js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        polling_start = js.index("async function pollReminders")
+        polling_end = js.index("function playReminderTone")
+        polling = js[polling_start:polling_end]
+
+        self.assertIn('reminder.alert_status === "pending"', polling)
+        self.assertIn("activeReminders", polling)
+        self.assertIn("playReminderTone(activeReminders[0].risk_level)", polling)
 
     def test_css_supports_polished_alert_detail_layout(self):
         css = (ROOT / "static" / "styles.css").read_text(encoding="utf-8")

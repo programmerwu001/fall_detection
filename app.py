@@ -7,7 +7,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from config import DB_PATH, EVENT_DIR
+from config import (
+    DB_PATH,
+    DEFAULT_HIGH_RISK_REPEAT_SECONDS,
+    DEFAULT_LOW_RISK_REPEAT_SECONDS,
+    EVENT_DIR,
+    PRIVACY_PREVIEW_DIR,
+)
+from services.alert_policy import HIGH_RISK, LOW_RISK
+from services.event_repository import EventRepository
 from services.frontend_data import (
     alerts,
     camera_dashboard,
@@ -24,6 +32,7 @@ from services.frontend_data import (
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 DEFAULT_CONFIG_PATH = BASE_DIR / "configs" / "detection_config.json"
+VIDEO_FILE_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".mpeg", ".mpg", ".wmv", ".flv", ".webm"}
 
 
 def create_api_response(
@@ -157,6 +166,31 @@ class FrontendRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=404)
         except FileNotFoundError as exc:
             self._send_json({"error": str(exc)}, status=404)
+        except PermissionError as exc:
+            self._send_json({"error": str(exc)}, status=403)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, status=500)
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        try:
+            if path.startswith("/api/events/") and path.endswith("/handle"):
+                event_id = unquote(path[len("/api/events/") : -len("/handle")])
+                handled_by = self.headers.get("X-User-Account") or "demo_caregiver"
+                _configured_repository().mark_event_handled(
+                    event_id=event_id,
+                    handled_by=handled_by,
+                )
+                self._send_json(event_detail(EVENT_DIR, event_id, DB_PATH))
+                return
+            self._send_json({"error": "Not found"}, status=404)
+        except KeyError as exc:
+            self._send_json({"error": str(exc)}, status=404)
+        except PermissionError as exc:
+            self._send_json({"error": str(exc)}, status=403)
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=400)
         except Exception as exc:
@@ -172,11 +206,19 @@ class FrontendRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/alerts":
             self._send_json({"alerts": alerts(EVENT_DIR, DB_PATH)})
             return
+        if path == "/api/reminders":
+            reminders = [
+                event
+                for event in _configured_repository().claim_due_reminders()
+                if event.get("alert_status") == "pending"
+            ]
+            self._send_json({"reminders": [_public_reminder(event) for event in reminders]})
+            return
         if path == "/api/fall-events":
             self._send_json(
                 {
                     "events": fall_events(EVENT_DIR, DB_PATH),
-                    "empty_message": "当前暂无已确认摔倒事件。",
+                    "empty_message": "当前暂无高风险摔倒告警。",
                 }
             )
             return
@@ -184,7 +226,7 @@ class FrontendRequestHandler(BaseHTTPRequestHandler):
             self._send_json(
                 {
                     "alerts": review_alerts(EVENT_DIR, DB_PATH),
-                    "empty_message": "当前暂无待复核告警。",
+                    "empty_message": "当前暂无低风险摔倒告警。",
                 }
             )
             return
@@ -205,6 +247,8 @@ class FrontendRequestHandler(BaseHTTPRequestHandler):
 
     def _send_static(self, path: str) -> None:
         file_path = route_static_path(path, STATIC_DIR)
+        if file_path.suffix.lower() in VIDEO_FILE_SUFFIXES:
+            raise PermissionError("Video files are not served")
         if not file_path.exists() or not file_path.is_file():
             raise FileNotFoundError(str(file_path))
         body = file_path.read_bytes()
@@ -218,7 +262,12 @@ class FrontendRequestHandler(BaseHTTPRequestHandler):
         )
 
     def _send_media(self, token: str) -> None:
-        file_path = resolve_media_token(unquote(token), EVENT_DIR)
+        try:
+            file_path = resolve_media_token(unquote(token), PRIVACY_PREVIEW_DIR)
+        except ValueError as exc:
+            raise PermissionError("Raw event media is not served by this endpoint") from exc
+        if file_path.name != "privacy_preview.mp4":
+            raise PermissionError("Raw event media is not served by this endpoint")
         status, headers, body = create_media_response(
             file_path,
             self.headers.get("Range"),
@@ -251,6 +300,45 @@ def main() -> None:
         pass
     finally:
         server.server_close()
+
+
+def _public_reminder(event: dict) -> dict:
+    risk_level = str(event.get("risk_level") or "")
+    high_repeat, low_repeat = _configured_repeat_seconds()
+    return {
+        "event_id": event.get("event_id"),
+        "camera_id": event.get("camera_id"),
+        "risk_level": risk_level,
+        "alert_status": event.get("alert_status"),
+        "reminder_count": event.get("reminder_count"),
+        "last_notified_at": event.get("last_notified_at"),
+        "next_remind_at": event.get("next_remind_at"),
+        "repeat_seconds": high_repeat if risk_level == HIGH_RISK else low_repeat if risk_level == LOW_RISK else None,
+    }
+
+
+def _configured_repository() -> EventRepository:
+    high_repeat, low_repeat = _configured_repeat_seconds()
+    return EventRepository(
+        DB_PATH,
+        high_risk_repeat_seconds=high_repeat,
+        low_risk_repeat_seconds=low_repeat,
+    ).initialize()
+
+
+def _configured_repeat_seconds() -> tuple[int, int]:
+    config = selected_config(DEFAULT_CONFIG_PATH)
+    return (
+        _safe_int(config.get("high_risk_repeat_seconds"), DEFAULT_HIGH_RISK_REPEAT_SECONDS),
+        _safe_int(config.get("low_risk_repeat_seconds"), DEFAULT_LOW_RISK_REPEAT_SECONDS),
+    )
+
+
+def _safe_int(value: object, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 if __name__ == "__main__":

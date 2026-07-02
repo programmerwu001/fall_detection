@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import logging
 import os
 import socket
@@ -57,6 +58,8 @@ def main() -> int:
         max_new_tokens=args.vlm_max_new_tokens,
         temperature=args.vlm_temperature,
     )
+    logger.info("Loading VLM model before polling jobs")
+    verifier.load()
 
     try:
         stats = run_worker_loop(
@@ -66,6 +69,7 @@ def main() -> int:
             lease_seconds=args.lease_seconds,
             poll_interval_seconds=args.poll_interval_seconds,
             max_retries=args.max_retries,
+            decision_deadline_seconds=args.decision_deadline_seconds,
             once=args.once,
             max_jobs=args.max_jobs,
         )
@@ -84,6 +88,7 @@ def run_worker_loop(
     lease_seconds: int,
     poll_interval_seconds: float,
     max_retries: int,
+    decision_deadline_seconds: Optional[float],
     once: bool = False,
     max_jobs: Optional[int] = None,
 ) -> WorkerStats:
@@ -103,6 +108,7 @@ def run_worker_loop(
             worker_id=worker_id,
             lease_seconds=lease_seconds,
             max_retries=max_retries,
+            decision_deadline_seconds=decision_deadline_seconds,
         )
         stats.add(current)
 
@@ -120,6 +126,7 @@ def process_next_job(
     worker_id: str,
     lease_seconds: int,
     max_retries: int,
+    decision_deadline_seconds: Optional[float] = None,
 ) -> WorkerStats:
     stats = WorkerStats()
     job = repository.lease_vlm_job(
@@ -143,9 +150,11 @@ def process_next_job(
 
         candidate = event["candidate"]
         clip_path = str(event["clip_path"])
-        verification = verifier.verify(
+        verification = _verify_with_deadline(
+            verifier=verifier,
             candidate=candidate,
             clip_path=clip_path,
+            timeout_seconds=decision_deadline_seconds,
         )
         verification = normalize_verification(
             verification=verification,
@@ -171,16 +180,16 @@ def process_next_job(
     except Exception as exc:
         stats.failed = 1
         logger.exception(
-            "VLM job failed: job_id=%s event_id=%s error=%s",
+            "VLM job failed: job_id=%s event_id=%s error_type=%s",
             job_id,
             event_id,
-            exc,
+            exc.__class__.__name__,
         )
         try:
-            repository.fail_vlm_job(
+            repository.mark_vlm_job_degraded(
                 job_id=job_id,
-                error=str(exc),
-                max_retries=max_retries,
+                reason=str(exc),
+                failure_status="timeout" if isinstance(exc, TimeoutError) else "failed",
             )
         except Exception:
             stats.errors += 1
@@ -211,11 +220,44 @@ def normalize_verification(
     metadata = normalized.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
-    metadata.setdefault("clip_path", event.get("clip_path"))
     metadata.setdefault("vlm_job_id", job.get("job_id"))
     metadata.setdefault("worker_id", worker_id)
     normalized["metadata"] = metadata
     return normalized
+
+
+def _verify_with_deadline(
+    verifier: VideoVLMVerifier,
+    candidate: Dict[str, Any],
+    clip_path: str,
+    timeout_seconds: Optional[float],
+) -> Dict[str, Any]:
+    if timeout_seconds is None:
+        return verifier.verify(candidate=candidate, clip_path=clip_path)
+    if timeout_seconds <= 0:
+        raise TimeoutError("VLM decision deadline exceeded")
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(
+        verifier.verify,
+        candidate=candidate,
+        clip_path=clip_path,
+    )
+    try:
+        result = future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError as exc:
+        future.cancel()
+        # Python cannot interrupt an already-running native/GPU inference thread.
+        # Wait before returning so a timed-out job does not keep consuming GPU in
+        # the background after the repository has already marked it failed.
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise TimeoutError("VLM decision deadline exceeded") from exc
+    except Exception:
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+        return result
 
 
 def final_status_from_verification(verification: Dict[str, Any]) -> str:
@@ -238,6 +280,7 @@ def _default_arg_values() -> Dict[str, Any]:
         "lease_seconds": 300,
         "poll_interval_seconds": 2.0,
         "max_retries": 2,
+        "decision_deadline_seconds": 120.0,
         "once": False,
         "max_jobs": None,
         "vlm_model": DEFAULT_VLM_MODEL,
@@ -262,6 +305,11 @@ def build_arg_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         default=defaults["poll_interval_seconds"],
     )
     parser.add_argument("--max-retries", type=int, default=defaults["max_retries"])
+    parser.add_argument(
+        "--decision-deadline-seconds",
+        type=float,
+        default=defaults["decision_deadline_seconds"],
+    )
     parser.add_argument("--once", action=argparse.BooleanOptionalAction, default=defaults["once"])
     parser.add_argument("--max-jobs", type=int, default=defaults["max_jobs"])
 

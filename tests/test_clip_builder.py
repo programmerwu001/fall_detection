@@ -34,6 +34,121 @@ class FakeCv2:
 
 
 class ClipBuilderTest(unittest.TestCase):
+    def test_save_debug_copy_true_writes_private_clip_and_debug_mirror(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            private_dir = root / "private_events"
+            debug_dir = root / "events"
+            builder = ClipBuilder(
+                output_dir=debug_dir,
+                internal_output_dir=private_dir,
+                save_debug_raw_event_copy=True,
+            )
+            candidate = {
+                "camera_id": "cam1",
+                "candidate_id": "c1",
+                "timestamp_ms": 1000,
+                "source_uri": "E:/raw/source.mp4",
+            }
+            frame = np.zeros((16, 16, 3), dtype=np.uint8)
+            frames = [
+                {
+                    "camera_id": "cam1",
+                    "frame_id": 1,
+                    "timestamp_ms": 1000,
+                    "frame": frame,
+                    "width": 16,
+                    "height": 16,
+                    "fps": 5,
+                    "source_uri": "E:/raw/source.mp4",
+                }
+            ]
+
+            def write_fake_clip(clip_path, frame_packets, fps, width, height):
+                clip_path.write_bytes(b"private clip")
+                return len(frame_packets)
+
+            with patch.object(builder, "_write_video", side_effect=write_fake_clip):
+                saved = builder.save_event_clip(
+                    candidate=candidate,
+                    verification=None,
+                    frame_packets=frames,
+                )
+
+            private_clip = Path(saved["clip_path"])
+            debug_clip = Path(saved["debug_clip_path"])
+            debug_metadata = json.loads(
+                Path(saved["debug_metadata_path"]).read_text(encoding="utf-8")
+            )
+
+            self.assertTrue(private_clip.exists())
+            self.assertTrue(debug_clip.exists())
+            self.assertTrue(private_clip.is_relative_to(private_dir))
+            self.assertTrue(debug_clip.is_relative_to(debug_dir))
+            self.assertNotEqual(private_clip, debug_clip)
+            self.assertEqual(debug_clip.read_bytes(), b"private clip")
+            serialized = json.dumps(debug_metadata, ensure_ascii=False)
+            self.assertNotIn("source_uri", serialized)
+            self.assertNotIn("clip_path", serialized)
+            self.assertNotIn("source.mp4", serialized)
+
+    def test_save_debug_copy_false_writes_only_private_clip_and_moves_old_debug_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            private_dir = root / "private_events"
+            debug_dir = root / "events"
+            disabled_dir = root / "disabled_debug_events"
+            old_dir = debug_dir / "cam1" / "20260627"
+            old_dir.mkdir(parents=True)
+            (old_dir / "event_1.mp4").write_bytes(b"old debug")
+            (old_dir / "event_1.json").write_text(
+                json.dumps({"clip_path": "E:/events/event_1.mp4"}),
+                encoding="utf-8",
+            )
+            builder = ClipBuilder(
+                output_dir=debug_dir,
+                internal_output_dir=private_dir,
+                disabled_debug_dir=disabled_dir,
+                save_debug_raw_event_copy=False,
+            )
+            candidate = {
+                "camera_id": "cam1",
+                "candidate_id": "c1",
+                "timestamp_ms": 1000,
+            }
+            frame = np.zeros((16, 16, 3), dtype=np.uint8)
+            frames = [
+                {
+                    "camera_id": "cam1",
+                    "frame_id": 1,
+                    "timestamp_ms": 1000,
+                    "frame": frame,
+                    "width": 16,
+                    "height": 16,
+                    "fps": 5,
+                    "source_uri": "E:/raw/source.mp4",
+                }
+            ]
+
+            def write_fake_clip(clip_path, frame_packets, fps, width, height):
+                clip_path.write_bytes(b"private clip")
+                return len(frame_packets)
+
+            with patch.object(builder, "_write_video", side_effect=write_fake_clip):
+                saved = builder.save_event_clip(
+                    candidate=candidate,
+                    verification=None,
+                    frame_packets=frames,
+                )
+
+            self.assertTrue(Path(saved["clip_path"]).exists())
+            self.assertNotIn("debug_clip_path", saved)
+            self.assertFalse((old_dir / "event_1.mp4").exists())
+            self.assertFalse((old_dir / "event_1.json").exists())
+            self.assertTrue((disabled_dir / "cam1" / "20260627" / "event_1.mp4").exists())
+            self.assertEqual(list(debug_dir.rglob("*.mp4")), [])
+            self.assertEqual(list(debug_dir.rglob("*.json")), [])
+
     def test_save_candidate_clip_allows_missing_verification(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             builder = ClipBuilder(output_dir=temp_dir)

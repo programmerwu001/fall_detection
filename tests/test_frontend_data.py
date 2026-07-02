@@ -5,6 +5,7 @@ from pathlib import Path
 
 from services.event_repository import EventRepository
 from services.frontend_data import (
+    PUBLIC_EVENT_FIELDS,
     alerts,
     camera_dashboard,
     event_detail,
@@ -17,6 +18,7 @@ from services.frontend_data import (
     selected_config,
     showcase_cases,
 )
+import services.frontend_data as frontend_data
 
 
 class FrontendDataTest(unittest.TestCase):
@@ -25,6 +27,7 @@ class FrontendDataTest(unittest.TestCase):
         self.root = Path(self.temp_dir.name)
         self.event_dir = self.root / "events"
         self.config_path = self.root / "detection_config.json"
+        self.preview_dir = self.root / "privacy_previews"
         self.confirmed_clip = self.event_dir / "confirmed.mp4"
         self.candidate_clip = self.event_dir / "candidate.mp4"
         self.review_clip = self.event_dir / "review.mp4"
@@ -38,8 +41,11 @@ class FrontendDataTest(unittest.TestCase):
             clip.parent.mkdir(parents=True, exist_ok=True)
             clip.write_bytes(b"fake mp4")
         self._write_events()
+        self.original_preview_dir = frontend_data.PRIVACY_PREVIEW_DIR
+        frontend_data.PRIVACY_PREVIEW_DIR = self.preview_dir
 
     def tearDown(self):
+        frontend_data.PRIVACY_PREVIEW_DIR = self.original_preview_dir
         self.temp_dir.cleanup()
 
     def test_list_events_reads_json_and_standardizes_rows(self):
@@ -47,15 +53,22 @@ class FrontendDataTest(unittest.TestCase):
 
         self.assertEqual(len(rows), 4)
         confirmed = next(row for row in rows if row["event_id"] == "event_confirmed")
-        self.assertEqual(confirmed["display_status"], "confirmed_fall")
-        self.assertEqual(confirmed["status_label"], "已确认摔倒")
+        self.assertEqual(confirmed["display_status"], "high_risk")
+        self.assertEqual(confirmed["status_label"], "高风险摔倒告警")
         self.assertEqual(confirmed["camera_id"], "file_cam_001")
         self.assertEqual(confirmed["area_label"], "模拟区域")
         self.assertEqual(confirmed["yolo_score"], 0.82)
-        self.assertEqual(confirmed["vlm_result"], "confirmed_fall")
+        self.assertEqual(confirmed["vlm_label"], "高风险摔倒告警")
         self.assertEqual(confirmed["vlm_confidence"], 0.91)
-        self.assertTrue(confirmed["media_url"].startswith("/media/"))
-        self.assertIn("?v=", confirmed["media_url"])
+        self.assertEqual(confirmed["risk_level"], "high_risk")
+        self.assertTrue(set(confirmed).issubset(PUBLIC_EVENT_FIELDS))
+        self.assertNotIn("clip_path", confirmed)
+        self.assertNotIn("media_url", confirmed)
+        self.assertNotIn("privacy_preview_path", confirmed)
+        self.assertNotIn("source_uri", confirmed)
+        self.assertNotIn("metadata_path", confirmed)
+        self.assertNotIn("confirmed.mp4", json.dumps(confirmed, ensure_ascii=False))
+        self.assertNotIn("confirmed_fall", json.dumps(confirmed, ensure_ascii=False))
 
     def test_sqlite_status_overrides_json_category(self):
         db_path = self.root / "records.db"
@@ -81,22 +94,22 @@ class FrontendDataTest(unittest.TestCase):
             for camera in dashboard["cameras"]
             if camera["camera_id"] == "file_cam_001"
         )
-        self.assertEqual(cam["risk_status"], "confirmed_fall")
+        self.assertEqual(cam["risk_status"], "high_risk")
 
     def test_camera_dashboard_aggregates_cameras_and_highest_risk(self):
         dashboard = camera_dashboard(self.event_dir, None)
 
         self.assertEqual(dashboard["summary"]["camera_count"], 3)
-        self.assertEqual(dashboard["summary"]["confirmed_fall"], 1)
-        self.assertEqual(dashboard["summary"]["review_alerts"], 1)
-        self.assertEqual(dashboard["summary"]["candidate_alerts"], 1)
-        self.assertEqual(dashboard["summary"]["rejected"], 1)
+        self.assertEqual(dashboard["summary"]["high_risk"], 1)
+        self.assertEqual(dashboard["summary"]["low_risk"], 1)
+        self.assertEqual(dashboard["summary"]["pending_detection"], 1)
+        self.assertEqual(dashboard["summary"]["no_alarm"], 1)
         cam1 = next(
             camera
             for camera in dashboard["cameras"]
             if camera["camera_id"] == "file_cam_001"
         )
-        self.assertEqual(cam1["risk_status"], "confirmed_fall")
+        self.assertEqual(cam1["risk_status"], "normal")
         self.assertIn("暂无实时画面", cam1["placeholder_text"])
         self.assertNotIn("stream_url", cam1)
         cam3 = next(
@@ -113,25 +126,35 @@ class FrontendDataTest(unittest.TestCase):
         )
         self.assertEqual(
             {row["event_id"] for row in review_alerts(self.event_dir, None)},
-            {"event_candidate", "event_review"},
+            {"event_review"},
         )
         self.assertEqual(
             {row["event_id"] for row in alerts(self.event_dir, None)},
-            {"event_confirmed", "event_candidate", "event_review"},
+            {"event_confirmed", "event_review"},
         )
         self.assertNotIn(
             "event_rejected",
             {row["event_id"] for row in showcase_cases(self.event_dir, None)},
         )
 
+    def test_legacy_json_only_events_are_read_only_not_pending_alerts(self):
+        confirmed = next(
+            row for row in list_events(self.event_dir, None)
+            if row["event_id"] == "event_confirmed"
+        )
+
+        self.assertEqual(confirmed["risk_level"], "high_risk")
+        self.assertEqual(confirmed["alert_status"], "legacy_read_only")
+        self.assertFalse(confirmed["can_handle"])
+
     def test_evaluation_summary_counts_rejected(self):
         summary = evaluation_summary(self.event_dir, None)
 
-        self.assertEqual(summary["displayed_cases"], 3)
-        self.assertEqual(summary["confirmed_fall"], 1)
-        self.assertEqual(summary["review_alerts"], 1)
-        self.assertEqual(summary["candidate_alerts"], 1)
-        self.assertEqual(summary["rejected"], 1)
+        self.assertEqual(summary["displayed_cases"], 2)
+        self.assertEqual(summary["high_risk"], 1)
+        self.assertEqual(summary["low_risk"], 1)
+        self.assertEqual(summary["pending_detection"], 1)
+        self.assertEqual(summary["no_alarm"], 1)
         self.assertEqual(summary["yolo"]["candidates"], 4)
         self.assertEqual(summary["vlm"]["verified_events"], 3)
         self.assertFalse(summary["label_evaluation"]["available"])
@@ -163,11 +186,11 @@ class FrontendDataTest(unittest.TestCase):
 
         summary = evaluation_summary(self.event_dir, db_path)
 
-        self.assertEqual(summary["displayed_cases"], 4)
-        self.assertEqual(summary["confirmed_fall"], 2)
+        self.assertEqual(summary["displayed_cases"], 3)
+        self.assertEqual(summary["high_risk"], 2)
         self.assertEqual(summary["yolo"]["candidates"], 5)
         self.assertEqual(summary["vlm"]["verified_events"], 4)
-        self.assertEqual(summary["vlm"]["confirmed_fall"], 2)
+        self.assertEqual(summary["vlm"]["high_risk"], 2)
 
     def test_event_detail_returns_standard_sections(self):
         detail = event_detail(self.event_dir, "event_confirmed", None)
@@ -175,6 +198,15 @@ class FrontendDataTest(unittest.TestCase):
         self.assertEqual(detail["event"]["event_id"], "event_confirmed")
         self.assertEqual(detail["candidate"]["score"], 0.82)
         self.assertEqual(detail["verification"]["confidence"], 0.91)
+        serialized = json.dumps(detail, ensure_ascii=False)
+        self.assertNotIn("clip_path", serialized)
+        self.assertNotIn("media_url", serialized)
+        self.assertNotIn("privacy_preview_path", serialized)
+        self.assertNotIn("source_uri", serialized)
+        self.assertNotIn("metadata_path", serialized)
+        self.assertNotIn("confirmed.mp4", serialized)
+        self.assertNotIn("confirmed_fall", serialized)
+        self.assertNotIn("need_human_review", serialized)
         self.assertEqual(
             detail["status_explanations"]["privacy_status"],
             "原始视频，尚未加密",
@@ -200,6 +232,67 @@ class FrontendDataTest(unittest.TestCase):
         outside_token = media_token_for_path(outside)
         with self.assertRaises(ValueError):
             resolve_media_token(outside_token, self.event_dir)
+
+    def test_ready_privacy_preview_exposes_controlled_media_url_only(self):
+        db_path = self.root / "records.db"
+        preview = self.preview_dir / "event_candidate" / "privacy_preview.mp4"
+        preview.parent.mkdir(parents=True)
+        preview.write_bytes(b"preview")
+        repository = EventRepository(db_path).initialize()
+        repository.create_candidate_event(
+            event_id="event_candidate",
+            camera_id="file_cam_001",
+            source_uri="E:/source/candidate.mp4",
+            clip_path=str(self.candidate_clip),
+            metadata_path=str(self.event_dir / "event_candidate.json"),
+            candidate={"score": 0.66},
+            yolo_score=0.66,
+        )
+        repository.record_event_decision(
+            event_id="event_candidate",
+            verification={"result": "need_human_review", "confidence": 0.5},
+            final_status="need_human_review",
+        )
+        job = repository.lease_privacy_preview_job("privacy-worker", 60)
+        repository.complete_privacy_preview_job(job["job_id"], str(preview))
+
+        event = event_detail(self.event_dir, "event_candidate", db_path)["event"]
+        serialized = json.dumps(event, ensure_ascii=False)
+
+        self.assertEqual(event["privacy_preview_status"], "ready")
+        self.assertTrue(event["privacy_preview_url"].startswith("/media/"))
+        self.assertNotIn(str(self.candidate_clip), serialized)
+        self.assertNotIn(str(preview), serialized)
+        self.assertNotIn(str(self.root), serialized)
+        self.assertNotIn("privacy_preview_path", event)
+
+    def test_failed_privacy_preview_has_no_media_url_and_no_raw_fallback(self):
+        db_path = self.root / "records.db"
+        repository = EventRepository(db_path).initialize()
+        repository.create_candidate_event(
+            event_id="event_candidate",
+            camera_id="file_cam_001",
+            source_uri="E:/source/candidate.mp4",
+            clip_path=str(self.candidate_clip),
+            metadata_path=str(self.event_dir / "event_candidate.json"),
+            candidate={"score": 0.66},
+            yolo_score=0.66,
+        )
+        repository.record_event_decision(
+            event_id="event_candidate",
+            verification={"result": "need_human_review", "confidence": 0.5},
+            final_status="need_human_review",
+        )
+        job = repository.lease_privacy_preview_job("privacy-worker", 60)
+        repository.fail_privacy_preview_job(job["job_id"], "mask model failed", max_retries=1)
+
+        event = event_detail(self.event_dir, "event_candidate", db_path)["event"]
+        serialized = json.dumps(event, ensure_ascii=False)
+
+        self.assertEqual(event["privacy_preview_status"], "failed")
+        self.assertNotIn("privacy_preview_url", event)
+        self.assertNotIn(str(self.candidate_clip), serialized)
+        self.assertNotIn("candidate.mp4", serialized)
 
     def test_selected_config_filters_comment_fields(self):
         self.config_path.write_text(

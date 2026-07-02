@@ -278,6 +278,12 @@ main {
   background: var(--surface-quiet);
 }
 
+.button-link.handle-button {
+  min-height: 34px;
+  padding: 7px 12px;
+  font-size: 13px;
+}
+
 .surveillance-wall {
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -502,11 +508,12 @@ main {
   overflow: hidden;
 }
 
-.camera-card.confirmed_fall {
+.camera-card.high_risk {
   border-color: rgba(196, 49, 45, 0.55);
 }
 
-.camera-card.need_human_review,
+.camera-card.low_risk,
+.camera-card.pending_detection,
 .camera-card.candidates {
   border-color: rgba(184, 110, 0, 0.55);
 }
@@ -643,20 +650,36 @@ main {
   white-space: nowrap;
 }
 
-.risk-badge.confirmed_fall,
-.status-badge.confirmed_fall {
+.risk-badge.high_risk,
+.status-badge.high_risk {
   border-color: rgba(196, 49, 45, 0.32);
   background: #fff0ef;
   color: var(--alarm-red);
 }
 
-.risk-badge.need_human_review,
-.status-badge.need_human_review,
+.risk-badge.low_risk,
+.status-badge.low_risk,
+.risk-badge.pending_detection,
+.status-badge.pending_detection,
 .risk-badge.candidates,
 .status-badge.candidates {
   border-color: rgba(184, 110, 0, 0.34);
   background: #fff7e8;
   color: var(--review-amber);
+}
+
+.risk-badge.handled,
+.status-badge.handled {
+  border-color: rgba(45, 106, 79, 0.28);
+  background: #edf7f1;
+  color: var(--care-green-dark);
+}
+
+.risk-badge.no_alarm,
+.status-badge.no_alarm {
+  border-color: rgba(100, 116, 139, 0.22);
+  background: #f8fafc;
+  color: var(--muted);
 }
 
 .risk-badge.normal,
@@ -767,13 +790,22 @@ main {
   background: var(--care-green);
 }
 
-.rail-step.confirmed_fall::before {
+.rail-step.high_risk::before {
   background: var(--alarm-red);
 }
 
-.rail-step.need_human_review::before,
+.rail-step.low_risk::before,
+.rail-step.pending_detection::before,
 .rail-step.candidates::before {
   background: var(--review-amber);
+}
+
+.rail-step.handled::before {
+  background: var(--care-green);
+}
+
+.rail-step.no_alarm::before {
+  background: var(--muted);
 }
 
 .rail-step span {
@@ -811,6 +843,13 @@ main {
   overflow-wrap: anywhere;
   font-family: var(--data-font);
   font-size: 22px;
+}
+
+.detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .detail-panel.sticky-detail {
@@ -912,6 +951,57 @@ main {
 
 .empty-video {
   margin-bottom: 0;
+}
+
+.reminder-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border: 1px solid rgba(196, 49, 45, 0.18);
+  border-left: 4px solid var(--alarm-red);
+  border-radius: var(--radius);
+  background: #fff8f7;
+}
+
+.reminder-banner span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.reminder-banner strong {
+  color: var(--ink);
+}
+
+.reminder-list {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.reminder-chip {
+  min-height: 32px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: #ffffff;
+  color: var(--ink);
+  font-weight: 760;
+  cursor: pointer;
+}
+
+.reminder-chip.high_risk {
+  border-color: rgba(196, 49, 45, 0.32);
+  color: var(--alarm-red);
+}
+
+.reminder-chip.low_risk {
+  border-color: rgba(184, 110, 0, 0.34);
+  color: var(--review-amber);
 }
 
 .filter-bar {

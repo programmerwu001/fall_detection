@@ -101,19 +101,20 @@ class FileVideoSource:
 
         video_path = Path(self.source_uri).expanduser()
         if not video_path.exists():
-            raise FileNotFoundError(f"Video file does not exist: {video_path}")
+            raise FileNotFoundError("Video file does not exist")
         if not video_path.is_file():
-            raise FileVideoSourceError(f"Video source is not a file: {video_path}")
+            raise FileVideoSourceError("Video source is not a file")
         if video_path.suffix.lower() not in self.SUPPORTED_EXTENSIONS:
             logger.warning(
-                "Video extension is not in the common supported list: source_uri=%s",
-                video_path,
+                "Video extension is not in the common supported list: camera_id=%s suffix=%s",
+                self.camera_id,
+                video_path.suffix.lower(),
             )
 
         capture = cv2.VideoCapture(str(video_path))
         if not capture.isOpened():
             capture.release()
-            raise FileVideoSourceError(f"Failed to open video file: {video_path}")
+            raise FileVideoSourceError("Failed to open video file")
 
         self._capture = capture
         self._opened = True
@@ -121,10 +122,9 @@ class FileVideoSource:
         self._reset_runtime_state()
 
         logger.info(
-            "Opened file video source: camera_id=%s source_uri=%s width=%s height=%s "
+            "Opened file video source: camera_id=%s width=%s height=%s "
             "source_fps=%.3f output_fps=%.3f frame_count=%s realtime=%s loop=%s",
             self.camera_id,
-            self.source_uri,
             self._width,
             self._height,
             self._source_fps,
@@ -154,9 +154,8 @@ class FileVideoSource:
                     continue
 
                 logger.info(
-                    "Reached end of video source: camera_id=%s source_uri=%s",
+                    "Reached end of video source: camera_id=%s",
                     self.camera_id,
-                    self.source_uri,
                 )
                 return None
 
@@ -198,9 +197,8 @@ class FileVideoSource:
 
         if self._opened:
             logger.info(
-                "Closed file video source: camera_id=%s source_uri=%s",
+                "Closed file video source: camera_id=%s",
                 self.camera_id,
-                self.source_uri,
             )
 
         self._opened = False
@@ -239,9 +237,9 @@ class FileVideoSource:
         fps = float(self._capture.get(cv2.CAP_PROP_FPS) or 0.0)
         if fps <= 0:
             logger.warning(
-                "Video FPS is missing or invalid; using default %.1f FPS: %s",
+                "Video FPS is missing or invalid; using default %.1f FPS: camera_id=%s",
                 self.DEFAULT_FPS,
-                self.source_uri,
+                self.camera_id,
             )
             fps = self.DEFAULT_FPS
 
@@ -315,13 +313,10 @@ class FileVideoSource:
         self._loop_count += 1
 
         if not self._capture.set(cv2.CAP_PROP_POS_FRAMES, 0):
-            raise FileVideoSourceError(
-                f"Failed to rewind video source for loop: {self.source_uri}"
-            )
+            raise FileVideoSourceError("Failed to rewind video source for loop")
 
         logger.debug(
-            "Looped file video source: camera_id=%s source_uri=%s loop_count=%s",
+            "Looped file video source: camera_id=%s loop_count=%s",
             self.camera_id,
-            self.source_uri,
             self._loop_count,
         )
